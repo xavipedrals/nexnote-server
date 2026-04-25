@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Editor / local config
+.claude/
+.idea/
+.vscode/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node (defensive — no package.json today, but keep)
+node_modules/
+*.log
+
+# Cloudflare Wrangler local cache
+.wrangler/
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+
+# marketing-site generated artifacts (produced by build_function.py)
+marketing-site/index.ts
+marketing-site/deploy_payload.json

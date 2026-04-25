@@ -1,0 +1,27 @@
+# https://supabase.com/docs/guides/local-development/cli/config
+# Only non-default settings are listed here. Anything omitted falls back to
+# the CLI's built-in defaults for the installed version.
+
+project_id = "cuvbqytpwentiekfkglq"
+
+# The iOS app uses an `sb_publishable_...` key rather than a legacy anon JWT.
+# When no user session exists, supabase-swift falls back to sending the
+# publishable key as the `Authorization: Bearer` header, which is not a JWT
+# and would fail the gateway's verify_jwt check with a 401. The function
+# itself validates the caller via `userClient.auth.getUser()`, so auth is
+# still enforced in-function.
+[functions.summarize-transcript]
+verify_jwt = false
+
+[functions.translate-summary]
+verify_jwt = false
+
+[functions.pick-folder-emoji]
+verify_jwt = false
+
+[functions.ask-ai-chat]
+verify_jwt = false
+
+[functions.generate-flashcards]
+verify_jwt = false
+
