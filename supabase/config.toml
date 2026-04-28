@@ -25,3 +25,11 @@ verify_jwt = false
 [functions.generate-flashcards]
 verify_jwt = false
 
+[functions.enqueue-podcast]
+verify_jwt = false
+
+[functions.enqueue-transcription]
+verify_jwt = false
+
+[functions.generate-quiz]
+verify_jwt = false

@@ -1,3 +1,16 @@
+import { supabase, geminiKey } from "./clients.js";
+import { SYSTEM_PROMPT, buildUserPrompt } from "./prompt.js";
+
+interface Args {
+    jobId: string;
+    noteId: string;
+    bucket: string;
+    path: string;
+}
+
+// ~200k tokens; well under Gemini 2.5 Flash's 1M context.
+const MAX_TRANSCRIPT_CHARS = 800_000;
+
 const MODEL = "gemini-2.5-flash";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
@@ -7,7 +20,86 @@ const OUTPUT_PRICE_PER_1M = 2.50;
 
 const TITLE_MAX_CHARS = 40;
 
-export interface GeminiResult {
+export async function runSummaryJob(args: Args): Promise<void> {
+    const { jobId, noteId, bucket, path } = args;
+
+    try {
+        await supabase
+            .from("summary_jobs")
+            .update({ status: "processing", started_at: new Date().toISOString() })
+            .eq("id", jobId);
+
+        const { data: file, error: dlErr } = await supabase.storage
+            .from(bucket)
+            .download(path);
+        if (dlErr || !file) {
+            throw new Error(`storage_download_failed: ${dlErr?.message}`);
+        }
+
+        let transcript = (await file.text()).trim();
+        if (!transcript) throw new Error("Transcript is empty");
+        if (transcript.length > MAX_TRANSCRIPT_CHARS) {
+            transcript = transcript.slice(0, MAX_TRANSCRIPT_CHARS);
+        }
+
+        const result = await generateSummary(SYSTEM_PROMPT, buildUserPrompt(transcript));
+
+        await supabase
+            .from("summary_jobs")
+            .update({
+                status: "complete",
+                markdown: result.markdown,
+                title: result.title,
+                icon: result.icon,
+                model: result.model,
+                input_tokens: result.inputTokens,
+                output_tokens: result.outputTokens,
+                cost_usd: result.costUsd,
+                completed_at: new Date().toISOString(),
+            })
+            .eq("id", jobId);
+
+        // Mirror onto the owning note so the iOS list + detail views flip from
+        // "Generating…" to the real summary via Realtime. Title / icon replace
+        // the placeholders the client wrote when it created the pending note.
+        await supabase
+            .from("notes")
+            .update({
+                title: result.title,
+                icon: result.icon,
+                ai_summary: result.markdown,
+                summary_status: "ready",
+                summary_error: null,
+            })
+            .eq("id", noteId);
+
+        console.log(`summary ${jobId} ready`);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`summary ${jobId} failed:`, message);
+        await supabase
+            .from("summary_jobs")
+            .update({
+                status: "failed",
+                error: message.slice(0, 2000),
+                completed_at: new Date().toISOString(),
+            })
+            .eq("id", jobId);
+        await supabase
+            .from("notes")
+            .update({
+                summary_status: "failed",
+                summary_error: message.slice(0, 2000),
+            })
+            .eq("id", noteId);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gemini call + response sanitization
+// ---------------------------------------------------------------------------
+
+interface SummaryResult {
     title: string;
     icon: string;
     markdown: string;
@@ -29,17 +121,7 @@ interface GeminiResponse {
     error?: { message?: string; status?: string };
 }
 
-interface StructuredPayload {
-    title?: unknown;
-    icon?: unknown;
-    markdown?: unknown;
-}
-
-export async function generateSummary(
-    systemPrompt: string,
-    userPrompt: string,
-    apiKey: string,
-): Promise<GeminiResult> {
+async function generateSummary(systemPrompt: string, userPrompt: string): Promise<SummaryResult> {
     const body = {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: "user", parts: [{ text: userPrompt }] }],
@@ -70,8 +152,8 @@ export async function generateSummary(
         },
     };
 
-    const response = await callWithRetry(ENDPOINT, apiKey, body);
-    const data: GeminiResponse = await response.json();
+    const response = await callWithRetry(ENDPOINT, body);
+    const data = (await response.json()) as GeminiResponse;
 
     if (data.error) {
         throw new Error(`Gemini API error: ${data.error.message ?? data.error.status}`);
@@ -89,7 +171,7 @@ export async function generateSummary(
     if (finishReason === "MAX_TOKENS") {
         throw new Error(
             "Summary hit the output-token cap and was truncated. " +
-            "Raise `maxOutputTokens` in gemini.ts or shorten the transcript.",
+            "Raise `maxOutputTokens` in summarize.ts or shorten the transcript.",
         );
     }
 
@@ -104,6 +186,12 @@ export async function generateSummary(
     return { title, icon, markdown, inputTokens, outputTokens, costUsd, model: MODEL };
 }
 
+interface StructuredPayload {
+    title?: unknown;
+    icon?: unknown;
+    markdown?: unknown;
+}
+
 function parseStructuredPayload(raw: string): { title: string; icon: string; markdown: string } {
     let parsed: StructuredPayload;
     try {
@@ -115,7 +203,7 @@ function parseStructuredPayload(raw: string): { title: string; icon: string; mar
         if (!raw.trimEnd().endsWith("}")) {
             throw new Error(
                 "Summary was truncated mid-response (Gemini hit its output-token cap). " +
-                "Shorten the source transcript or raise `maxOutputTokens` in gemini.ts.",
+                "Shorten the source transcript or raise `maxOutputTokens` in summarize.ts.",
             );
         }
         throw new Error(`Gemini returned non-JSON response: ${(err as Error).message}`);
@@ -144,17 +232,11 @@ function sanitizeMarkdown(value: unknown): string {
     if (typeof value !== "string") return "";
     let md = value;
 
-    // Cut at a stray ```json block opener (with or without leading newlines).
-    // We only worry about it if it appears *after* a substantial chunk of
-    // real content — the prompt forbids wrapping the whole body in a fence
-    // anyway, so any json fence in the body is suspicious.
     const strayMatch = md.match(/\n[\s`]*```json[\s\S]*$/);
     if (strayMatch && strayMatch.index !== undefined && strayMatch.index > 200) {
         md = md.slice(0, strayMatch.index);
     }
 
-    // Collapse any single run of >300 whitespace chars (Gemini stalling)
-    // into a single blank line. Real markdown never has this.
     md = md.replace(/\s{300,}/g, "\n\n");
 
     return md.trim();
@@ -163,11 +245,9 @@ function sanitizeMarkdown(value: unknown): string {
 function sanitizeTitle(value: unknown): string {
     if (typeof value !== "string") return "";
     let t = value.trim().replace(/\s+/g, " ");
-    // Strip wrapping quotes or trailing punctuation the model sometimes adds.
     t = t.replace(/^["'“”‘’]+|["'“”‘’]+$/g, "");
     t = t.replace(/[.!?;:,]+$/g, "");
     if (t.length > TITLE_MAX_CHARS) {
-        // Truncate at the last word boundary within the limit.
         const cut = t.slice(0, TITLE_MAX_CHARS);
         const lastSpace = cut.lastIndexOf(" ");
         t = (lastSpace > 10 ? cut.slice(0, lastSpace) : cut).trimEnd();
@@ -177,20 +257,20 @@ function sanitizeTitle(value: unknown): string {
 
 function sanitizeIcon(value: unknown): string {
     if (typeof value !== "string") return "";
-    // Take the first grapheme — this collapses any accidental multi-emoji output
+    // Take the first grapheme — collapses any accidental multi-emoji output
     // to a single glyph, including ZWJ sequences like "👨‍🏫".
     const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
     const first = segmenter.segment(value.trim()).containing(0)?.segment ?? "";
     return first;
 }
 
-async function callWithRetry(url: string, apiKey: string, body: unknown): Promise<Response> {
+async function callWithRetry(url: string, body: unknown): Promise<Response> {
     const maxAttempts = 3;
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            const res = await fetch(`${url}?key=${apiKey}`, {
+            const res = await fetch(`${url}?key=${geminiKey}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),

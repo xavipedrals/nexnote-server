@@ -1,0 +1,130 @@
+import { spawn } from "node:child_process";
+import { mkdtemp, writeFile, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createReadStream } from "node:fs";
+import { supabase, openai } from "./clients.js";
+
+interface Args {
+    sourceId: string;
+    userId: string;
+    noteId: string;
+    storagePath: string;
+}
+
+// Whisper API hard limit is 25 MB. We compress to mono 16 kHz @ 48 kbps,
+// which fits ~70 minutes per file. For longer audio we'd add chunking; iOS
+// caps lecture length so this is enough for v1.
+const WHISPER_MAX_BYTES = 25 * 1024 * 1024;
+
+export async function runTranscriptionJob(args: Args): Promise<void> {
+    const { sourceId, noteId, storagePath } = args;
+    const workDir = await mkdtemp(path.join(tmpdir(), `whisper-${sourceId}-`));
+
+    try {
+        // 1. Download original audio from Storage.
+        const { data: file, error: dlErr } = await supabase.storage
+            .from("note-sources")
+            .download(storagePath);
+        if (dlErr || !file) {
+            throw new Error(`download_failed: ${dlErr?.message}`);
+        }
+        const originalPath = path.join(workDir, "input");
+        await writeFile(originalPath, Buffer.from(await file.arrayBuffer()));
+
+        // 2. Compress with ffmpeg → mono 16 kHz MP3 @ 48 kbps.
+        const compressedPath = path.join(workDir, "compressed.mp3");
+        await runFfmpeg([
+            "-y",
+            "-i", originalPath,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-b:a", "48k",
+            compressedPath,
+        ]);
+
+        const { size } = await stat(compressedPath);
+        if (size > WHISPER_MAX_BYTES) {
+            throw new Error(`audio_too_large: ${size} bytes after compression (limit ${WHISPER_MAX_BYTES})`);
+        }
+
+        // 3. Whisper transcription.
+        const transcription = await openai.audio.transcriptions.create({
+            file: createReadStream(compressedPath) as any,
+            model: "whisper-1",
+            response_format: "verbose_json",
+        });
+        const text = (transcription as { text?: string }).text?.trim() ?? "";
+        const duration = (transcription as { duration?: number }).duration;
+
+        if (!text) throw new Error("empty_transcript");
+
+        // 4. Write transcript back onto the source row.
+        const { error: updErr } = await supabase
+            .from("note_sources")
+            .update({
+                status: "ready",
+                extracted_text: text,
+                duration_secs: duration ? Math.round(duration) : null,
+                extraction_error: null,
+            })
+            .eq("id", sourceId);
+        if (updErr) throw new Error(`source_update_failed: ${updErr.message}`);
+
+        // 5. Append into the note's merged transcript so summarize-transcript
+        //    and downstream features pick it up. Append (don't overwrite) —
+        //    a note can have several sources.
+        await appendToNoteTranscript(noteId, text);
+
+        console.log(`transcription ${sourceId} ready (${text.length} chars)`);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`transcription ${sourceId} failed:`, message);
+        await supabase
+            .from("note_sources")
+            .update({
+                status: "failed",
+                extraction_error: message.slice(0, 2000),
+            })
+            .eq("id", sourceId);
+    } finally {
+        await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
+async function appendToNoteTranscript(noteId: string, addition: string): Promise<void> {
+    const { data: note, error } = await supabase
+        .from("notes")
+        .select("raw_transcript")
+        .eq("id", noteId)
+        .single();
+    if (error) {
+        console.warn(`could not append transcript for note ${noteId}: ${error.message}`);
+        return;
+    }
+    const existing = note?.raw_transcript ?? "";
+    const merged = existing ? `${existing}\n\n${addition}` : addition;
+    const { error: updErr } = await supabase
+        .from("notes")
+        .update({ raw_transcript: merged })
+        .eq("id", noteId);
+    if (updErr) {
+        console.warn(`note transcript update failed: ${updErr.message}`);
+    }
+}
+
+function runFfmpeg(args: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+            stderr += String(chunk);
+        });
+        proc.on("error", reject);
+        proc.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
+        });
+    });
+}
