@@ -42,6 +42,10 @@ interface RequestBody {
     targetMinutes?: number;
     /// Optional title; if omitted the worker derives one from the script.
     title?: string;
+    /// ISO 639-1 language code for the generated podcast (e.g. "en", "es").
+    /// Overrides `notes.display_language_code` for both the LLM prompt and
+    /// the TTS engine. Falls back to the note's display language when null.
+    languageCode?: string;
 }
 
 Deno.serve(async (req) => {
@@ -66,6 +70,14 @@ Deno.serve(async (req) => {
         MIN_TARGET_MINUTES,
         MAX_TARGET_MINUTES,
     );
+
+    // Trim to a reasonable shape — anything past two letters is almost
+    // certainly garbage. We keep `null` (rather than empty string) so the
+    // worker's `?? note.display_language_code` fallback works cleanly.
+    const rawLang = (body.languageCode ?? "").trim().toLowerCase();
+    const languageCode = /^[a-z]{2,3}(-[a-z0-9]+)?$/i.test(rawLang)
+        ? rawLang
+        : null;
 
     // Identity check via user-scoped client.
     const userClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -137,6 +149,7 @@ Deno.serve(async (req) => {
             noteId,
             focus: body.focus ?? null,
             targetMinutes,
+            languageCode,
         }),
     }).catch((e) => {
         console.error("kick worker failed", e);

@@ -27,15 +27,21 @@ function requireSecret(req: Request, res: Response, next: NextFunction) {
 // must be deployed with `--cpu-always-allocated` (or equivalent) so the
 // container keeps CPU after the response is sent.
 app.post("/podcast", requireSecret, (req, res) => {
-    const { podcastId, userId, noteId, focus, targetMinutes } = req.body ?? {};
+    const { podcastId, userId, noteId, focus, targetMinutes, languageCode } =
+        req.body ?? {};
     if (!podcastId || !userId || !noteId) {
         res.status(400).json({ error: "invalid_body" });
         return;
     }
     res.status(202).json({ accepted: true });
-    runPodcastJob({ podcastId, userId, noteId, focus, targetMinutes }).catch(
-        (err) => console.error(`podcast ${podcastId} crashed:`, err),
-    );
+    runPodcastJob({
+        podcastId,
+        userId,
+        noteId,
+        focus,
+        targetMinutes,
+        languageCode,
+    }).catch((err) => console.error(`podcast ${podcastId} crashed:`, err));
 });
 
 // POST /transcribe — enqueued by the `enqueue-transcription` edge function.

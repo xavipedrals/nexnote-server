@@ -6,6 +6,9 @@ interface Args {
     noteId: string;
     focus?: string | null;
     targetMinutes?: number;
+    /// User-picked language. Overrides `notes.display_language_code` when
+    /// provided — used for both the Gemini prompt and the xAI TTS request.
+    languageCode?: string | null;
 }
 
 interface ScriptLine {
@@ -41,13 +44,19 @@ export async function runPodcastJob(args: Args): Promise<void> {
 
         await writeProgress(podcastId, PROGRESS_LOADED);
 
+        // Caller's pick wins; otherwise fall back to whatever language the
+        // note's summary is currently displayed in. Either may be null —
+        // generateScript handles that by telling the LLM to match the source.
+        const effectiveLanguage =
+            args.languageCode ?? note.display_language_code ?? null;
+
         // 2. Generate script with Gemini.
         const script = await generateScript({
             title: note.title,
             content: sourceText,
             focus: args.focus ?? null,
             targetMinutes,
-            languageCode: note.display_language_code ?? null,
+            languageCode: effectiveLanguage,
         });
         if (script.length === 0) throw new Error("empty_script");
 
@@ -63,7 +72,7 @@ export async function runPodcastJob(args: Args): Promise<void> {
         //    actually watches advance.
         const audio = await synthesizeScript(
             script,
-            note.display_language_code ?? null,
+            effectiveLanguage,
             (lineIndex, totalLines) => {
                 const span = PROGRESS_TTS_END - PROGRESS_SCRIPT_DONE;
                 const pct = PROGRESS_SCRIPT_DONE

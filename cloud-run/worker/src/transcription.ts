@@ -2,14 +2,59 @@ import { spawn } from "node:child_process";
 import { mkdtemp, writeFile, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { supabase, openai } from "./clients.js";
+import { runSummaryJob } from "./summarize.js";
+
+const TRANSCRIPT_BUCKET = "note-sources";
 
 interface Args {
     sourceId: string;
     userId: string;
     noteId: string;
     storagePath: string;
+}
+
+/// Chained after a successful transcription. Uploads the transcript text as
+/// a `.txt` blob in the same bucket as `summarize-transcript` expects, then
+/// inserts a `summary_jobs` row and runs the summary in-process — same
+/// container, no extra HTTP round-trip. Failures here are logged but don't
+/// fail the transcription itself: the user still has a transcribed note in
+/// `processing` they can retry from the UI.
+async function kickSummary(args: {
+    userId: string;
+    noteId: string;
+    transcript: string;
+}): Promise<void> {
+    const { userId, noteId, transcript } = args;
+    const transcriptPath = `users/${userId}/transcripts/${randomUUID()}.txt`;
+
+    const { error: uploadErr } = await supabase.storage
+        .from(TRANSCRIPT_BUCKET)
+        .upload(transcriptPath, Buffer.from(transcript, "utf-8"), {
+            contentType: "text/plain; charset=utf-8",
+            upsert: false,
+        });
+    if (uploadErr) throw new Error(`transcript_upload_failed: ${uploadErr.message}`);
+
+    const jobId = randomUUID();
+    const { error: jobErr } = await supabase.from("summary_jobs").insert({
+        id: jobId,
+        user_id: userId,
+        note_id: noteId,
+        bucket: TRANSCRIPT_BUCKET,
+        path: transcriptPath,
+        status: "queued",
+    });
+    if (jobErr) throw new Error(`summary_job_insert_failed: ${jobErr.message}`);
+
+    await runSummaryJob({
+        jobId,
+        noteId,
+        bucket: TRANSCRIPT_BUCKET,
+        path: transcriptPath,
+    });
 }
 
 // Whisper API hard limit is 25 MB. We compress to mono 16 kHz @ 48 kbps,
@@ -78,6 +123,29 @@ export async function runTranscriptionJob(args: Args): Promise<void> {
         await appendToNoteTranscript(noteId, text);
 
         console.log(`transcription ${sourceId} ready (${text.length} chars)`);
+
+        // 6. Hand the transcript off to summarization in-process. The note row
+        //    was created by iOS in `processing` state; this lands the title /
+        //    icon / markdown via Realtime so the list flips from
+        //    "Generating…" without iOS having to do a second round-trip.
+        try {
+            await kickSummary({ userId: args.userId, noteId, transcript: text });
+        } catch (summaryErr) {
+            const message = summaryErr instanceof Error
+                ? summaryErr.message
+                : String(summaryErr);
+            console.error(`transcription ${sourceId} summary kick failed:`, message);
+            // Don't clobber the transcript — only flag the note so the user
+            // sees a retry affordance instead of a silent stuck-spinner.
+            await supabase
+                .from("notes")
+                .update({
+                    summary_status: "failed",
+                    summary_error: message.slice(0, 2000),
+                })
+                .eq("id", noteId)
+                .eq("summary_status", "processing");
+        }
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`transcription ${sourceId} failed:`, message);

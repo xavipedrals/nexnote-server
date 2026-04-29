@@ -1,5 +1,5 @@
 import { supabase, geminiKey } from "./clients.js";
-import { SYSTEM_PROMPT, buildUserPrompt } from "./prompt.js";
+import { SYSTEM_PROMPT, buildUserPrompt, type MarkdownBudget } from "./prompt.js";
 
 interface Args {
     jobId: string;
@@ -42,7 +42,8 @@ export async function runSummaryJob(args: Args): Promise<void> {
             transcript = transcript.slice(0, MAX_TRANSCRIPT_CHARS);
         }
 
-        const result = await generateSummary(SYSTEM_PROMPT, buildUserPrompt(transcript));
+        const { prompt: userPrompt, budget } = buildUserPrompt(transcript);
+        const result = await generateValidatedSummary(SYSTEM_PROMPT, userPrompt, budget);
 
         await supabase
             .from("summary_jobs")
@@ -62,16 +63,39 @@ export async function runSummaryJob(args: Args): Promise<void> {
         // Mirror onto the owning note so the iOS list + detail views flip from
         // "Generating…" to the real summary via Realtime. Title / icon replace
         // the placeholders the client wrote when it created the pending note.
+        //
+        // We also seed `display_language_code` with whatever language Gemini
+        // detected the source content in. This is what the summary is written
+        // in too, so it's the right starting point for downstream features
+        // (podcast / quiz / flashcard generators read this column to match
+        // the user's reading language). `translate-summary` overwrites it
+        // later if the user explicitly translates.
+        //
+        // The `.in("summary_status", ...)` guard is what prevents a stale
+        // worker from clobbering a result another concurrent run already
+        // landed. If two retries fire (user double-tapped, network retry,
+        // etc.), both kick separate worker runs that read the note in
+        // parallel; whichever finishes first writes its result and flips
+        // status to `ready`. A second, later finisher would then see
+        // `summary_status='ready'`, the filter would not match, and the
+        // late write becomes a no-op — exactly what we want. We allow
+        // `failed` here too so a slow successful retry can rescue a note
+        // that an earlier run had marked failed.
+        const noteUpdate: Record<string, unknown> = {
+            title: result.title,
+            icon: result.icon,
+            ai_summary: result.markdown,
+            summary_status: "ready",
+            summary_error: null,
+        };
+        if (result.languageCode) {
+            noteUpdate.display_language_code = result.languageCode;
+        }
         await supabase
             .from("notes")
-            .update({
-                title: result.title,
-                icon: result.icon,
-                ai_summary: result.markdown,
-                summary_status: "ready",
-                summary_error: null,
-            })
-            .eq("id", noteId);
+            .update(noteUpdate)
+            .eq("id", noteId)
+            .in("summary_status", ["processing", "failed"]);
 
         console.log(`summary ${jobId} ready`);
     } catch (err) {
@@ -85,13 +109,19 @@ export async function runSummaryJob(args: Args): Promise<void> {
                 completed_at: new Date().toISOString(),
             })
             .eq("id", jobId);
+        // Only mark the note as failed if it's still `processing`. A
+        // concurrent successful retry may have already flipped it to
+        // `ready`; we must not clobber that with a stale failure. The
+        // matching iOS-side guard is the same `.eq("summary_status",
+        // "processing")` in `failStaleProcessingNotes`.
         await supabase
             .from("notes")
             .update({
                 summary_status: "failed",
                 summary_error: message.slice(0, 2000),
             })
-            .eq("id", noteId);
+            .eq("id", noteId)
+            .eq("summary_status", "processing");
     }
 }
 
@@ -103,6 +133,11 @@ interface SummaryResult {
     title: string;
     icon: string;
     markdown: string;
+    /// ISO 639-1 lowercase code of the source language Gemini detected.
+    /// `null` only when sanitization rejected whatever the model returned —
+    /// callers should leave `notes.display_language_code` untouched in that
+    /// case rather than overwriting it with junk.
+    languageCode: string | null;
     inputTokens: number;
     outputTokens: number;
     costUsd: number;
@@ -121,20 +156,108 @@ interface GeminiResponse {
     error?: { message?: string; status?: string };
 }
 
+/// Validates that the model's already-sanitized markdown looks structurally
+/// well-formed. Returns null when fine, or an issue describing what's wrong
+/// so the retry path can log it. Checks (in cheapest-first order):
+///   1. Length sanity — beyond 1.5x the advertised hard cap is almost always
+///      a runaway generation, not legitimate content.
+///   2. No single line longer than 2 000 chars — Gemini's table-row loops
+///      manifest as one absurdly long line (the dash-wall in the screenshot
+///      lived inside a table separator row). Sanitization collapses
+///      repeating-char runs but a row containing other long content can
+///      still survive at >2k chars.
+///   3. No remaining run of 31+ identical non-whitespace chars — sanitizer
+///      should have collapsed these; if any survive, something else is off.
+interface MarkdownIssue {
+    code: "too_long" | "long_line" | "repeating_chars";
+    detail: string;
+}
+
+function validateMarkdown(md: string, budget: MarkdownBudget): MarkdownIssue | null {
+    const overshoot = Math.round(budget.hardMax * 1.5);
+    if (md.length > overshoot) {
+        return {
+            code: "too_long",
+            detail: `markdown is ${md.length} chars, hardMax was ${budget.hardMax}`,
+        };
+    }
+
+    for (const line of md.split("\n")) {
+        if (line.length > 2_000) {
+            return {
+                code: "long_line",
+                detail: `line of ${line.length} chars`,
+            };
+        }
+    }
+
+    const repeat = md.match(/(\S)\1{30,}/);
+    if (repeat) {
+        return {
+            code: "repeating_chars",
+            detail: `run of '${repeat[1]}' x ${repeat[0].length}`,
+        };
+    }
+
+    return null;
+}
+
+/// Runs `generateSummary`, validates the output, and retries once if the
+/// first attempt looks malformed. The retry uses the same prompt and params
+/// — at temperature 0.4 the next sample diverges from the loop state that
+/// produced the garbage. Two attempts keeps cost bounded: ≥99 % of calls
+/// succeed on the first try, so the average overhead is small even though
+/// the worst case doubles tokens.
+///
+/// If both attempts fail validation we throw, which lands in
+/// `runSummaryJob`'s catch block and surfaces as a user-visible failure
+/// they can retry from the UI. Better than shipping a wall of dashes.
+async function generateValidatedSummary(
+    systemPrompt: string,
+    userPrompt: string,
+    budget: MarkdownBudget,
+): Promise<SummaryResult> {
+    const MAX_ATTEMPTS = 2;
+    let lastIssue: MarkdownIssue | null = null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const result = await generateSummary(systemPrompt, userPrompt);
+        const issue = validateMarkdown(result.markdown, budget);
+        if (!issue) {
+            if (attempt > 1) {
+                console.log(`summary recovered on attempt ${attempt}`);
+            }
+            return result;
+        }
+        console.warn(
+            `summary validation failed (attempt ${attempt}/${MAX_ATTEMPTS}): ` +
+                `${issue.code} — ${issue.detail}`,
+        );
+        lastIssue = issue;
+    }
+
+    throw new Error(
+        `Summary failed validation after ${MAX_ATTEMPTS} attempts: ` +
+            `${lastIssue?.code} — ${lastIssue?.detail}`,
+    );
+}
+
 async function generateSummary(systemPrompt: string, userPrompt: string): Promise<SummaryResult> {
     const body = {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: "user", parts: [{ text: userPrompt }] }],
         generationConfig: {
             temperature: 0.4,
-            // 16384 is plenty for any reasonable study-note summary
-            // (≈12 000–14 000 markdown chars). The previous 65535 cap was
-            // tempting the model to ramble — at the high end Gemini would
-            // sometimes finish the JSON's `markdown` value, then emit a wall
-            // of whitespace and a stray ```json envelope opener inside the
-            // same string field. Capping output keeps generations focused
-            // and bounded.
-            maxOutputTokens: 16384,
+            // 24576 is a safety net for dense academic content (especially
+            // Spanish / Portuguese, which run ~20 % more tokens per char than
+            // English) where Gemini occasionally over-produces despite the
+            // prompt's length cap. The prompt itself is the primary throttle —
+            // see `prompt.ts` for the per-call markdown character target.
+            // Cap is well below Gemini 2.5 Flash's 65 536 limit; raising it
+            // higher tempted the model to ramble and corrupt the structured
+            // JSON output (whitespace walls, stray ```json fences inside the
+            // markdown string).
+            maxOutputTokens: 24576,
             // Structured-summary task doesn't need chain-of-thought; disabling
             // thinking keeps the full output budget available for the JSON.
             thinkingConfig: { thinkingBudget: 0 },
@@ -145,9 +268,10 @@ async function generateSummary(systemPrompt: string, userPrompt: string): Promis
                     title: { type: "string" },
                     icon: { type: "string" },
                     markdown: { type: "string" },
+                    language_code: { type: "string" },
                 },
-                required: ["title", "icon", "markdown"],
-                propertyOrdering: ["title", "icon", "markdown"],
+                required: ["title", "icon", "markdown", "language_code"],
+                propertyOrdering: ["title", "icon", "markdown", "language_code"],
             },
         },
     };
@@ -175,7 +299,7 @@ async function generateSummary(systemPrompt: string, userPrompt: string): Promis
         );
     }
 
-    const { title, icon, markdown } = parseStructuredPayload(raw);
+    const { title, icon, markdown, languageCode } = parseStructuredPayload(raw);
 
     const inputTokens = data.usageMetadata?.promptTokenCount ?? 0;
     const outputTokens = data.usageMetadata?.candidatesTokenCount ?? 0;
@@ -183,16 +307,22 @@ async function generateSummary(systemPrompt: string, userPrompt: string): Promis
         (inputTokens / 1_000_000) * INPUT_PRICE_PER_1M +
         (outputTokens / 1_000_000) * OUTPUT_PRICE_PER_1M;
 
-    return { title, icon, markdown, inputTokens, outputTokens, costUsd, model: MODEL };
+    return { title, icon, markdown, languageCode, inputTokens, outputTokens, costUsd, model: MODEL };
 }
 
 interface StructuredPayload {
     title?: unknown;
     icon?: unknown;
     markdown?: unknown;
+    language_code?: unknown;
 }
 
-function parseStructuredPayload(raw: string): { title: string; icon: string; markdown: string } {
+function parseStructuredPayload(raw: string): {
+    title: string;
+    icon: string;
+    markdown: string;
+    languageCode: string | null;
+} {
     let parsed: StructuredPayload;
     try {
         parsed = JSON.parse(raw);
@@ -212,22 +342,29 @@ function parseStructuredPayload(raw: string): { title: string; icon: string; mar
     const title = sanitizeTitle(parsed.title);
     const icon = sanitizeIcon(parsed.icon);
     const markdown = sanitizeMarkdown(parsed.markdown);
+    const languageCode = sanitizeLanguageCode(parsed.language_code);
 
     if (!title) throw new Error("Gemini response missing `title`");
     if (!icon) throw new Error("Gemini response missing `icon`");
     if (!markdown) throw new Error("Gemini response missing `markdown`");
 
-    return { title, icon, markdown };
+    return { title, icon, markdown, languageCode };
 }
 
-/// Repairs the two failure modes we've seen Gemini fall into when it
+/// Repairs failure modes we've seen Gemini fall into when it
 /// over-generates inside a structured-output JSON string field:
 ///   1. A run of pure-whitespace padding hundreds of chars long.
 ///   2. A stray ```json envelope opener appearing well after the legitimate
 ///      markdown finishes — Gemini "restarting" the structured output inside
 ///      the markdown string.
-/// Both are recoverable: the legitimate prefix is real content. We trim the
-/// junk tail and keep what's useful.
+///   3. A run of the same non-whitespace character repeated dozens / thousands
+///      of times — classic autoregressive token-loop pathology, most often a
+///      markdown table separator row (`|:------------…------|`) where the
+///      decoder gets stuck on `-`. Even at 31 chars a single-char run is
+///      essentially never legitimate (markdown HRs / table separators use 3),
+///      so we collapse anything ≥31 to 3 of that char.
+/// All three are recoverable: the legitimate prefix is real content. We trim
+/// junk and keep what's useful.
 function sanitizeMarkdown(value: unknown): string {
     if (typeof value !== "string") return "";
     let md = value;
@@ -238,6 +375,9 @@ function sanitizeMarkdown(value: unknown): string {
     }
 
     md = md.replace(/\s{300,}/g, "\n\n");
+    // Collapse 31+ identical non-whitespace chars down to 3. The capture
+    // group is the repeated char; the replacement re-emits it three times.
+    md = md.replace(/(\S)\1{30,}/g, "$1$1$1");
 
     return md.trim();
 }
@@ -262,6 +402,16 @@ function sanitizeIcon(value: unknown): string {
     const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
     const first = segmenter.segment(value.trim()).containing(0)?.segment ?? "";
     return first;
+}
+
+/// Accepts only well-formed ISO 639-1 (2-letter) or 639-2/3 (3-letter)
+/// language codes, lowercased. Anything else returns null so the caller
+/// leaves `notes.display_language_code` untouched rather than poisoning the
+/// column with junk like "english" or "en-US-fr".
+function sanitizeLanguageCode(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    return /^[a-z]{2,3}$/.test(normalized) ? normalized : null;
 }
 
 async function callWithRetry(url: string, body: unknown): Promise<Response> {

@@ -78,6 +78,42 @@ Deno.serve(async (req) => {
         auth: { persistSession: false },
     });
 
+    // Dedup: if there's already a fresh queued / processing job for this
+    // note, reuse it instead of kicking a second worker. Without this guard,
+    // a user double-tapping Retry — or just retrying while a previous worker
+    // is still running — produces N parallel Gemini calls all writing back
+    // to the same note row. They race, and the user sees the UI flicker
+    // between `failed` and `ready` as different runs land in
+    // non-deterministic order. (The worker's status guard prevents
+    // corruption but can't prevent the visible flicker.)
+    //
+    // The 5-minute window is generous: a healthy summarize call finishes in
+    // well under a minute. If a job has been queued / processing for longer
+    // we treat it as dead and let a fresh kick supersede it. Worker writes
+    // are idempotent under the status guard, so the late finisher (if any)
+    // simply no-ops.
+    const FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
+    const cutoff = new Date(Date.now() - FRESHNESS_WINDOW_MS).toISOString();
+    const { data: liveJobs, error: liveErr } = await admin
+        .from("summary_jobs")
+        .select("id, status, created_at")
+        .eq("note_id", body.noteId)
+        .eq("user_id", userId)
+        .in("status", ["queued", "processing"])
+        .gte("created_at", cutoff)
+        .order("created_at", { ascending: false })
+        .limit(1);
+    if (liveErr) {
+        return json({ error: `Dedup check failed: ${liveErr.message}` }, 500);
+    }
+    if (liveJobs && liveJobs.length > 0) {
+        const existing = liveJobs[0];
+        console.log(
+            `summarize-transcript: dedup hit, reusing job ${existing.id} for note ${body.noteId}`,
+        );
+        return json({ jobId: existing.id, status: existing.status, deduped: true }, 202);
+    }
+
     const jobId = body.jobId ?? crypto.randomUUID();
     const { data: job, error: upsertErr } = await admin
         .from("summary_jobs")
