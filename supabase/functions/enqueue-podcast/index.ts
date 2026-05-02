@@ -46,6 +46,10 @@ interface RequestBody {
     /// Overrides `notes.display_language_code` for both the LLM prompt and
     /// the TTS engine. Falls back to the note's display language when null.
     languageCode?: string;
+    /// When true (e.g. iOS DEBUG), worker uses APNs sandbox for the completion
+    /// push for this job. Production iOS builds omit this; Cloud Run env
+    /// `APNS_USE_SANDBOX` remains the default for everyone else.
+    useApnsSandbox?: boolean;
 }
 
 Deno.serve(async (req) => {
@@ -150,6 +154,7 @@ Deno.serve(async (req) => {
             focus: body.focus ?? null,
             targetMinutes,
             languageCode,
+            ...(body.useApnsSandbox === true ? { useApnsSandbox: true } : {}),
         }),
     }).catch((e) => {
         console.error("kick worker failed", e);
