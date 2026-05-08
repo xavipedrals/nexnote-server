@@ -285,15 +285,33 @@ Deno.serve(async (req) => {
     }
 
     // --- Finalize ------------------------------------------------------------
-    const { error: finalErr } = await admin
-        .from("flashcard_decks")
-        .update({
-            status: "ready",
-            generation_started_at: null,
-            generation_error: null,
-        })
-        .eq("id", deckId);
+    // Must not return 500 here without flipping status: cards may already be
+    // committed while the deck row still says `generating` (client banner
+    // stuck forever). Retry a few times, then mark failed so stale-lock
+    // + retry can recover.
+    let finalErr: { message: string } | null = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const { error: err } = await admin
+            .from("flashcard_decks")
+            .update({
+                status: "ready",
+                generation_started_at: null,
+                generation_error: null,
+            })
+            .eq("id", deckId);
+        if (!err) {
+            finalErr = null;
+            break;
+        }
+        finalErr = err;
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+    }
     if (finalErr) {
+        await failDeck(
+            admin,
+            deckId,
+            `finalize_failed after retries: ${finalErr.message}`,
+        );
         return json({ error: "finalize_failed" }, 500);
     }
 
