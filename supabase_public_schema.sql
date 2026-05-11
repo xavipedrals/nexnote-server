@@ -54,6 +54,17 @@ CREATE TYPE "public"."deck_status" AS ENUM (
 ALTER TYPE "public"."deck_status" OWNER TO "postgres";
 
 
+CREATE TYPE "public"."exam_period" AS ENUM (
+    'learning',
+    'maintenance',
+    'consolidation',
+    'retrievability'
+);
+
+
+ALTER TYPE "public"."exam_period" OWNER TO "postgres";
+
+
 CREATE TYPE "public"."note_report_reason" AS ENUM (
     'copyright',
     'harmful',
@@ -268,6 +279,206 @@ end $$;
 
 
 ALTER FUNCTION "public"."clone_note"("p_note_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") RETURNS TABLE("flashcard_id" "uuid")
+    LANGUAGE "sql" STABLE
+    AS $$
+    select fc.id
+    from exams e
+    join notes n           on n.folder_id = e.folder_id
+    join flashcard_decks d on d.note_id   = n.id
+    join flashcards fc     on fc.deck_id  = d.id
+    where e.id      = p_exam_id
+      and e.user_id = auth.uid();
+$$;
+
+
+ALTER FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") RETURNS TABLE("card_id" "uuid", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer)
+    LANGUAGE "sql" STABLE
+    AS $$
+    select
+        cs.flashcard_id as card_id,
+        p.state,
+        p.stability,
+        p.difficulty,
+        p.due_at,
+        p.last_reviewed_at,
+        p.elapsed_days,
+        p.scheduled_days,
+        p.step,
+        p.reps,
+        p.lapses
+    from exam_card_set(p_exam_id) cs
+    left join flashcard_progress p
+           on p.flashcard_id = cs.flashcard_id
+          and p.user_id      = auth.uid()
+    where coalesce(p.is_suspended, false) = false
+$$;
+
+
+ALTER FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer DEFAULT 20, "p_period" "public"."exam_period" DEFAULT 'maintenance'::"public"."exam_period", "p_new_count" integer DEFAULT 6, "p_exclude_ids" "uuid"[] DEFAULT ARRAY[]::"uuid"[]) RETURNS TABLE("card_id" "uuid", "front" "text", "back" "text", "hint" "text", "bucket" "text", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer, "active_retention" double precision)
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+#variable_conflict use_column
+declare
+    v_active_retention double precision;
+    v_exam exams%rowtype;
+    v_user uuid := auth.uid();
+begin
+    if v_user is null then
+        raise exception 'not_authenticated';
+    end if;
+
+    select * into v_exam from exams where id = p_exam_id and user_id = v_user;
+    if not found then
+        raise exception 'exam_not_found';
+    end if;
+
+    v_active_retention := case p_period
+        when 'learning'       then v_exam.desired_retention
+        when 'maintenance'    then v_exam.maintenance_retention
+        when 'consolidation'  then
+            (v_exam.maintenance_retention + v_exam.desired_retention) / 2
+        when 'retrievability' then v_exam.desired_retention
+    end;
+
+    return query
+    with
+    excluded_ids as (
+        select unnest(p_exclude_ids) as id
+    ),
+    card_pool as (
+        select cs.flashcard_id as id
+        from exam_card_set(p_exam_id) cs
+        where not exists (select 1 from excluded_ids e where e.id = cs.flashcard_id)
+    ),
+    enriched as (
+        select c.id as card_id,
+               c.front, c.back, c.hint,
+               p.state, p.stability, p.difficulty,
+               p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+               p.step, p.reps, p.lapses,
+               coalesce(p.is_suspended, false) as suspended
+        from card_pool cp
+        join flashcards c on c.id = cp.id
+        left join flashcard_progress p
+               on p.flashcard_id = c.id and p.user_id = v_user
+    ),
+    classified as (
+        select *,
+               case
+                 when suspended              then 'suspended'
+                 when enriched.state is null then 'new'
+                 when due_at <= now()        then 'due'
+                 else                              'ahead'
+               end as bucket
+        from enriched
+        where suspended = false
+    ),
+    due_pick as (
+        select * from classified
+        where bucket = 'due'
+        order by due_at asc
+        limit p_limit
+    ),
+    retrievability_pick as (
+        select * from classified c
+        where c.bucket = 'ahead'
+          and p_period = 'retrievability'
+          and v_exam.final_review_enabled
+          and not exists (select 1 from due_pick d where d.card_id = c.card_id)
+        order by c.stability asc nulls first, c.due_at asc
+        limit greatest(0, p_limit - (select count(*)::int from due_pick))
+    ),
+    new_pick as (
+        select * from classified c
+        where c.bucket = 'new'
+          and not exists (select 1 from due_pick d where d.card_id = c.card_id)
+        order by random()
+        limit greatest(0, least(
+            p_new_count,
+            p_limit - (select count(*)::int from due_pick)
+                    - (select count(*)::int from retrievability_pick)
+        ))
+    ),
+    pacing_fill_pick as (
+        select * from classified c
+        where c.bucket in ('new', 'ahead')
+          and p_period <> 'retrievability'::exam_period
+          and not exists (select 1 from due_pick d            where d.card_id = c.card_id)
+          and not exists (select 1 from new_pick n            where n.card_id = c.card_id)
+          and not exists (select 1 from retrievability_pick r where r.card_id = c.card_id)
+        order by c.stability asc nulls first, c.due_at asc, c.card_id
+        limit greatest(0,
+            p_limit
+            - (select count(*)::int from due_pick)
+            - (select count(*)::int from retrievability_pick)
+            - (select count(*)::int from new_pick)
+        )
+    ),
+    final as (
+        select * from due_pick
+        union all
+        select * from retrievability_pick
+        union all
+        select * from new_pick
+        union all
+        select * from pacing_fill_pick
+    )
+    select f.card_id, f.front, f.back, f.hint, f.bucket,
+           f.state, f.stability, f.difficulty,
+           f.due_at, f.last_reviewed_at, f.elapsed_days, f.scheduled_days,
+           f.step, f.reps, f.lapses,
+           v_active_retention as active_retention
+    from final f
+    order by
+        case f.bucket
+            when 'due'   then 0
+            when 'ahead' then 1
+            when 'new'   then 2
+            else              3
+        end,
+        coalesce(f.stability, 0) asc,
+        f.due_at asc nulls last,
+        f.card_id;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_recent_again_rate"("p_window_days" integer DEFAULT 7, "p_min_reviews" integer DEFAULT 10) RETURNS double precision
+    LANGUAGE "sql" STABLE
+    AS $$
+    with recent as (
+        select rating
+        from flashcard_reviews
+        where user_id     = auth.uid()
+          and reviewed_at >= now() - make_interval(days => greatest(1, p_window_days))
+    ),
+    counts as (
+        select
+            count(*)::int                              as total,
+            count(*) filter (where rating = 'again')   as agains
+        from recent
+    )
+    select case
+        when total < p_min_reviews then 0.0
+        else agains::double precision / total
+    end
+    from counts;
+$$;
+
+
+ALTER FUNCTION "public"."get_recent_again_rate"("p_window_days" integer, "p_min_reviews" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_limit" integer DEFAULT 20, "p_new_ratio" numeric DEFAULT 0.3, "p_allow_ahead" boolean DEFAULT false, "p_exclude_ids" "uuid"[] DEFAULT ARRAY[]::"uuid"[]) RETURNS TABLE("card_id" "uuid", "front" "text", "back" "text", "hint" "text", "bucket" "text", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer)
@@ -599,6 +810,29 @@ CREATE TABLE IF NOT EXISTS "public"."ai_jobs" (
 
 
 ALTER TABLE "public"."ai_jobs" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."exams" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "folder_id" "uuid" NOT NULL,
+    "exam_date" timestamp with time zone NOT NULL,
+    "start_date" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "target_reps" integer DEFAULT 3 NOT NULL,
+    "desired_retention" double precision DEFAULT 0.9 NOT NULL,
+    "maintenance_retention" double precision DEFAULT 0.9 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "study_on_exam_date" boolean DEFAULT false NOT NULL,
+    "final_review_enabled" boolean DEFAULT true NOT NULL,
+    CONSTRAINT "exams_date_after_start" CHECK (("exam_date" > "start_date")),
+    CONSTRAINT "exams_desired_retention_check" CHECK ((("desired_retention" > (0)::double precision) AND ("desired_retention" <= (1)::double precision))),
+    CONSTRAINT "exams_maintenance_retention_check" CHECK ((("maintenance_retention" > (0)::double precision) AND ("maintenance_retention" <= (1)::double precision))),
+    CONSTRAINT "exams_target_reps_check" CHECK ((("target_reps" >= 1) AND ("target_reps" <= 10)))
+);
+
+
+ALTER TABLE "public"."exams" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."flashcard_decks" (
@@ -986,6 +1220,16 @@ ALTER TABLE ONLY "public"."ai_jobs"
 
 
 
+ALTER TABLE ONLY "public"."exams"
+    ADD CONSTRAINT "exams_one_per_folder" UNIQUE ("user_id", "folder_id");
+
+
+
+ALTER TABLE ONLY "public"."exams"
+    ADD CONSTRAINT "exams_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."flashcard_decks"
     ADD CONSTRAINT "flashcard_decks_pkey" PRIMARY KEY ("id");
 
@@ -1135,6 +1379,14 @@ CREATE INDEX "ai_jobs_user_kind_created" ON "public"."ai_jobs" USING "btree" ("u
 
 
 
+CREATE INDEX "exams_user_active_idx" ON "public"."exams" USING "btree" ("user_id", "exam_date");
+
+
+
+CREATE INDEX "exams_user_folder_idx" ON "public"."exams" USING "btree" ("user_id", "folder_id");
+
+
+
 CREATE INDEX "flashcard_decks_note_id_idx" ON "public"."flashcard_decks" USING "btree" ("note_id");
 
 
@@ -1271,6 +1523,10 @@ CREATE OR REPLACE TRIGGER "summary_jobs_set_updated_at" BEFORE UPDATE ON "public
 
 
 
+CREATE OR REPLACE TRIGGER "t_exams_updated" BEFORE UPDATE ON "public"."exams" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "t_flashcard_progress_updated" BEFORE UPDATE ON "public"."flashcard_progress" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
@@ -1297,6 +1553,16 @@ CREATE OR REPLACE TRIGGER "t_profiles_updated" BEFORE UPDATE ON "public"."profil
 
 ALTER TABLE ONLY "public"."ai_jobs"
     ADD CONSTRAINT "ai_jobs_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exams"
+    ADD CONSTRAINT "exams_folder_id_fkey" FOREIGN KEY ("folder_id") REFERENCES "public"."folders"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exams"
+    ADD CONSTRAINT "exams_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -1530,6 +1796,25 @@ CREATE POLICY "decks select" ON "public"."flashcard_decks" FOR SELECT USING ("pu
 
 
 CREATE POLICY "decks write" ON "public"."flashcard_decks" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."exams" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "exams_delete_self" ON "public"."exams" FOR DELETE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exams_insert_self" ON "public"."exams" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exams_select_self" ON "public"."exams" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exams_update_self" ON "public"."exams" FOR UPDATE USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
 
 
 
@@ -1841,6 +2126,30 @@ GRANT ALL ON FUNCTION "public"."clone_note"("p_note_id" "uuid") TO "service_role
 
 
 
+GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_recent_again_rate"("p_window_days" integer, "p_min_reviews" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_recent_again_rate"("p_window_days" integer, "p_min_reviews" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_recent_again_rate"("p_window_days" integer, "p_min_reviews" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) TO "service_role";
@@ -1892,6 +2201,12 @@ GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
 GRANT ALL ON TABLE "public"."ai_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."ai_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."ai_jobs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."exams" TO "anon";
+GRANT ALL ON TABLE "public"."exams" TO "authenticated";
+GRANT ALL ON TABLE "public"."exams" TO "service_role";
 
 
 
