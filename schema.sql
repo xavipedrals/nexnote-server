@@ -715,6 +715,7 @@ CREATE TABLE IF NOT EXISTS "public"."folders" (
     "icon" "text",
     "color" "text",
     "sort_order" integer DEFAULT 0 NOT NULL,
+    "exam_date_prompt_collapsed" boolean DEFAULT false NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
