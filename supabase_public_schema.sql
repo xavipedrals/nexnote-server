@@ -667,6 +667,51 @@ $$;
 ALTER FUNCTION "public"."get_study_session"("p_deck_id" "uuid", "p_limit" integer, "p_new_ratio" numeric) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+    v_user uuid := auth.uid();
+begin
+    if v_user is null then
+        raise exception 'not_authenticated';
+    end if;
+
+    update public.notes n
+    set last_studied_at = greatest(coalesce(n.last_studied_at, '-infinity'::timestamptz), p_studied_at)
+    where n.id = p_note_id
+      and n.user_id = v_user;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+    v_user uuid := auth.uid();
+begin
+    if v_user is null then
+        raise exception 'not_authenticated';
+    end if;
+
+    if not public.can_access_note(p_note_id, p_require_study => true) then
+        raise exception 'forbidden';
+    end if;
+
+    perform public.bump_note_last_studied(p_note_id, now());
+end;
+$$;
+
+
+ALTER FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_step" smallint DEFAULT 0, "p_state_before" "public"."card_state" DEFAULT NULL::"public"."card_state", "p_stability_before" double precision DEFAULT NULL::double precision, "p_difficulty_before" double precision DEFAULT NULL::double precision, "p_elapsed_days" integer DEFAULT NULL::integer, "p_review_duration_ms" integer DEFAULT NULL::integer) RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -674,6 +719,7 @@ declare
     v_user   uuid        := auth.uid();
     v_now    timestamptz := now();
     v_lapsed boolean     := (p_rating = 'again');
+    v_note_id uuid;
 begin
     if v_user is null then
         raise exception 'not_authenticated';
@@ -716,6 +762,15 @@ begin
         p_stability_after, p_difficulty_after, p_scheduled_days,
         p_review_duration_ms, v_now
     );
+
+    select d.note_id into v_note_id
+    from public.flashcards c
+    join public.flashcard_decks d on d.id = c.deck_id
+    where c.id = p_card_id;
+
+    if v_note_id is not null then
+        perform public.bump_note_last_studied(v_note_id, v_now);
+    end if;
 end;
 $$;
 
@@ -1048,6 +1103,7 @@ CREATE TABLE IF NOT EXISTS "public"."notes" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_opened_at" timestamp with time zone,
+    "last_studied_at" timestamp with time zone,
     "display_language_code" "text",
     "summary_error" "text"
 );
@@ -1465,6 +1521,10 @@ CREATE INDEX "notes_user_id_folder_id_updated_at_idx" ON "public"."notes" USING 
 
 
 CREATE INDEX "notes_user_id_is_archived_updated_at_idx" ON "public"."notes" USING "btree" ("user_id", "is_archived", "updated_at" DESC);
+
+
+
+CREATE INDEX "notes_user_id_last_studied_at_idx" ON "public"."notes" USING "btree" ("user_id", "last_studied_at" DESC NULLS LAST);
 
 
 

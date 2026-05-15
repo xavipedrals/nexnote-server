@@ -1,0 +1,11 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appIDs": ["24Q78SLQKT.com.xavi.nexnote"],
+        "paths": ["/s/*"]
+      }
+    ]
+  }
+}

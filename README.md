@@ -24,7 +24,9 @@ This opens a browser, you authorize, and wrangler caches the account in `.wrangl
 From the repo root:
 
 ```sh
-npx wrangler@latest pages deploy marketing-site/dist --project-name=nexnote
+npx wrangler@latest pages deploy marketing-site/dist \
+  --project-name=nexnote \
+  --branch=production
 ```
 
 On the first run, wrangler will prompt to create the project if it doesn't exist and to pick a production branch — pick `master`. The selection is cached in `.wrangler/cache/pages.json` so subsequent runs are non-interactive.
@@ -49,7 +51,7 @@ npx wrangler pages secret put SUPABASE_ANON_KEY --project-name=nexnote
 
 ### Updating content
 
-Edit the source HTML/CSS in `marketing-site/`, copy the changed files into `marketing-site/dist/`, then re-run the deploy command above. (`dist/` is the directory wrangler uploads — anything not in there does not ship.) Pages Functions are picked up live from `marketing-site/functions/`; no copy step.
+Edit the source HTML/CSS in `marketing-site/`, copy the changed files into `marketing-site/dist/`, then re-run the deploy command above. (`dist/` is the directory wrangler uploads — anything not in there does not ship.) When changing Universal Links, also copy `marketing-site/.well-known/` → `marketing-site/dist/.well-known/` and `marketing-site/dist/_headers` if updated. Pages Functions are picked up live from `functions/` at the repo root; no copy step.
 
 ## Deploying Supabase pieces
 
