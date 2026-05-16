@@ -104,6 +104,14 @@ Deno.serve(async (req) => {
         .order("created_at", { ascending: false })
         .limit(1);
     if (liveErr) {
+        console.error("summarize-transcript: dedup query failed", {
+            message: liveErr.message,
+            code: liveErr.code,
+            details: liveErr.details,
+            hint: liveErr.hint,
+            noteId: body.noteId,
+            userId,
+        });
         return json({ error: `Dedup check failed: ${liveErr.message}` }, 500);
     }
     if (liveJobs && liveJobs.length > 0) {
@@ -136,6 +144,18 @@ Deno.serve(async (req) => {
         .select()
         .single();
     if (upsertErr || !job) {
+        console.error("summarize-transcript: summary_jobs upsert failed", {
+            message: upsertErr?.message,
+            code: upsertErr?.code,
+            details: upsertErr?.details,
+            hint: upsertErr?.hint,
+            noteId: body.noteId,
+            jobId,
+            userId,
+            bucket: body.bucket,
+            path: body.path,
+            hadJobRow: Boolean(job),
+        });
         return json({ error: `Failed to create job: ${upsertErr?.message}` }, 500);
     }
 

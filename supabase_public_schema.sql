@@ -230,19 +230,18 @@ CREATE OR REPLACE FUNCTION "public"."clone_note"("p_note_id" "uuid") RETURNS "uu
     AS $$
 declare
   new_note_id uuid;
-  r_deck      record;
-  new_deck_id uuid;
-  r_quiz      record;
-  new_quiz_id uuid;
 begin
   if not can_access_note(p_note_id, p_require_clone => true) then
     raise exception 'not permitted';
   end if;
 
-  insert into notes (user_id, folder_id, title, icon, raw_transcript, ai_summary,
-                     summary_status, word_count, page_count)
-  select auth.uid(), null, title, icon, raw_transcript, ai_summary,
-         summary_status, word_count, page_count
+  insert into notes (
+    user_id, folder_id, title, icon, raw_transcript, ai_summary,
+    summary_status, word_count, page_count, display_language_code
+  )
+  select
+    auth.uid(), null, title, icon, raw_transcript, ai_summary,
+    summary_status, word_count, page_count, display_language_code
   from notes where id = p_note_id
   returning id into new_note_id;
 
@@ -253,26 +252,6 @@ begin
          storage_path, source_url, mime_type, file_size_bytes,
          extracted_text, page_count, duration_secs
   from note_sources where note_id = p_note_id;
-
-  for r_deck in select * from flashcard_decks where note_id = p_note_id loop
-    insert into flashcard_decks (note_id, user_id, name, desired_retention)
-    values (new_note_id, auth.uid(), r_deck.name, r_deck.desired_retention)
-    returning id into new_deck_id;
-
-    insert into flashcards (deck_id, user_id, front, back, hint)
-    select new_deck_id, auth.uid(), front, back, hint
-    from flashcards where deck_id = r_deck.id;
-  end loop;
-
-  for r_quiz in select * from quizzes where note_id = p_note_id loop
-    insert into quizzes (note_id, user_id, title, question_count)
-    values (new_note_id, auth.uid(), r_quiz.title, r_quiz.question_count)
-    returning id into new_quiz_id;
-
-    insert into quiz_questions (quiz_id, position, question, explanation, options, correct_option)
-    select new_quiz_id, position, question, explanation, options, correct_option
-    from quiz_questions where quiz_id = r_quiz.id;
-  end loop;
 
   return new_note_id;
 end $$;
@@ -588,7 +567,7 @@ CREATE OR REPLACE FUNCTION "public"."uuidv7"() RETURNS "uuid"
     set_bit(
       set_bit(
         overlay(
-          gen_random_bytes(16)
+          extensions.gen_random_bytes(16)
           placing substring(int8send((extract(epoch from clock_timestamp()) * 1000)::bigint) from 3)
           from 1 for 6
         ),
@@ -809,6 +788,67 @@ end $$;
 
 
 ALTER FUNCTION "public"."redeem_share_link"("p_token" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_link note_share_links%rowtype;
+  v_user uuid := auth.uid();
+  new_note_id uuid;
+begin
+  if v_user is null then
+    raise exception 'not_authenticated';
+  end if;
+
+  select * into v_link
+  from note_share_links
+  where token = p_token
+    and revoked_at is null
+    and (expires_at is null or expires_at > now())
+    and (max_uses is null or use_count < max_uses);
+
+  if not found then
+    raise exception 'invalid or expired link';
+  end if;
+
+  if not v_link.can_clone then
+    raise exception 'not permitted';
+  end if;
+
+  insert into notes (
+    user_id, folder_id, title, icon, raw_transcript, ai_summary,
+    summary_status, word_count, page_count, display_language_code
+  )
+  select
+    v_user, null, title, icon, raw_transcript, ai_summary,
+    summary_status, word_count, page_count, display_language_code
+  from notes where id = v_link.note_id
+  returning id into new_note_id;
+
+  insert into note_sources (note_id, user_id, kind, status, display_name, sort_order,
+                            storage_path, source_url, mime_type, file_size_bytes,
+                            extracted_text, page_count, duration_secs)
+  select new_note_id, v_user, kind, status, display_name, sort_order,
+         storage_path, source_url, mime_type, file_size_bytes,
+         extracted_text, page_count, duration_secs
+  from note_sources where note_id = v_link.note_id;
+
+  delete from note_share_link_grants
+  where link_id = v_link.id
+    and user_id = v_user;
+
+  update note_share_links
+  set use_count = use_count + 1
+  where id = v_link.id;
+
+  return new_note_id;
+end $$;
+
+
+ALTER FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
@@ -2244,6 +2284,12 @@ GRANT ALL ON FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "p
 GRANT ALL ON FUNCTION "public"."redeem_share_link"("p_token" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."redeem_share_link"("p_token" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."redeem_share_link"("p_token" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "service_role";
 
 
 
