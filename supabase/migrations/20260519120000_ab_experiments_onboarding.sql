@@ -28,14 +28,28 @@ create policy "ab_experiments select public"
 grant select on table public.ab_experiments to anon;
 grant select on table public.ab_experiments to authenticated;
 
--- Onboarding: control = no rate-app screen (default); variant_b = show rate-app screen.
+-- Onboarding: control = no rate-app, vague Good company copy; variant_b = rate-app + specific counts.
 insert into public.ab_experiments (key, enabled, variants)
 values (
     'onboarding',
     true,
     '[
-        {"id": "control", "weight": 50, "config": {"includes_rate_app": false}},
-        {"id": "variant_b", "weight": 50, "config": {"includes_rate_app": true}}
+        {
+            "id": "control",
+            "weight": 50,
+            "config": {
+                "includes_rate_app": false,
+                "good_company_specific_counts": false
+            }
+        },
+        {
+            "id": "variant_b",
+            "weight": 50,
+            "config": {
+                "includes_rate_app": true,
+                "good_company_specific_counts": true
+            }
+        }
     ]'::jsonb
 )
 on conflict (key) do update

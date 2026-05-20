@@ -1,4 +1,4 @@
--- Swap onboarding A/B defaults: control skips rate-app; variant_b shows it.
+-- Onboarding A/B: control = vague social proof; variant_b = specific counts on Good company screen.
 update public.ab_experiments
 set
     variants = '[
