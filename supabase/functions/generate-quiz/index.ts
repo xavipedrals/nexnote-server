@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { checkDailyJobLimit } from "../_shared/premium.ts";
 import {
     generateQuestions,
     QuizDifficulty,
@@ -150,9 +151,10 @@ Deno.serve(async (req) => {
     }
 
     // --- Rate limit ----------------------------------------------------------
-    // Disabled for now — the quiz feature is unmetered for everyone while we
-    // grow usage. The `ai_jobs` insert further down still records each call,
-    // so re-enabling the gate later is a pure code change.
+    const rate = await checkDailyJobLimit(admin, userId, "generate_quiz");
+    if (!rate.allowed) {
+        return json(rate.body, rate.status);
+    }
 
     // --- Insert the quiz row in 'generating' state ---------------------------
     const quizTitle = requestedTitle ||

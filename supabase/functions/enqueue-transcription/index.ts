@@ -19,13 +19,14 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { checkDailyJobLimit } from "../_shared/premium.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const WORKER_URL = Deno.env.get("WORKER_URL")!;
 const WORKER_SHARED_SECRET = Deno.env.get("WORKER_SHARED_SECRET")!;
 
-const DAILY_RATE_LIMIT = 10; // transcriptions per user per 24h
+const JOB_KIND = "transcription";
 
 const CORS = {
     "Access-Control-Allow-Origin": "*",
@@ -83,17 +84,9 @@ Deno.serve(async (req) => {
         return json({ error: "already_in_progress" }, 409);
     }
 
-    // Rate-limit.
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const { count, error: countErr } = await admin
-        .from("ai_jobs")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("kind", "transcription")
-        .gte("created_at", since);
-    if (countErr) return json({ error: "rate_check_failed" }, 500);
-    if ((count ?? 0) >= DAILY_RATE_LIMIT) {
-        return json({ error: "rate_limited", limit: DAILY_RATE_LIMIT }, 429);
+    const rate = await checkDailyJobLimit(admin, userId, JOB_KIND);
+    if (!rate.allowed) {
+        return json(rate.body, rate.status);
     }
 
     // Flip the source to 'extracting' and clear any previous error.
@@ -105,7 +98,7 @@ Deno.serve(async (req) => {
         return json({ error: `update_failed: ${updateErr.message}` }, 500);
     }
 
-    await admin.from("ai_jobs").insert({ user_id: userId, kind: "transcription" });
+    await admin.from("ai_jobs").insert({ user_id: userId, kind: JOB_KIND });
 
     const kick = fetch(`${WORKER_URL}/transcribe`, {
         method: "POST",

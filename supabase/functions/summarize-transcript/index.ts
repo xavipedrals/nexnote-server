@@ -22,6 +22,7 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { checkSummaryLimit } from "../_shared/premium.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -122,6 +123,11 @@ Deno.serve(async (req) => {
         return json({ jobId: existing.id, status: existing.status, deduped: true }, 202);
     }
 
+    const summaryRate = await checkSummaryLimit(admin, userId);
+    if (!summaryRate.allowed) {
+        return json(summaryRate.body, summaryRate.status);
+    }
+
     const jobId = body.jobId ?? crypto.randomUUID();
     const { data: job, error: upsertErr } = await admin
         .from("summary_jobs")
@@ -164,6 +170,11 @@ Deno.serve(async (req) => {
             .from("summary_jobs")
             .update({ retry_count: (job.retry_count ?? 0) + 1 })
             .eq("id", jobId);
+    } else {
+        await admin.from("ai_jobs").insert({
+            user_id: userId,
+            kind: "summarize_transcript",
+        });
     }
 
     const noteId = body.noteId;

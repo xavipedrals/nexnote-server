@@ -37,5 +37,8 @@ verify_jwt = false
 [functions.submit-report]
 verify_jwt = false
 
+[functions.record-onboarding-dropoff]
+verify_jwt = false
+
 [functions.get-shared-note]
 verify_jwt = false

@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { checkDailyJobLimit } from "../_shared/premium.ts";
 import { generateBatch } from "./gemini.ts";
 import { normalizeFront } from "./dedup.ts";
 
@@ -36,7 +37,7 @@ const MIN_CHARS_PER_CARD = 200;
 const STALE_LOCK_MINUTES = 10;
 const BATCH_SIZE = 40;
 const LOW_YIELD_THRESHOLD = 10;
-const DAILY_RATE_LIMIT = 20;
+const JOB_KIND = "generate_flashcards";
 
 const CORS = {
     "Access-Control-Allow-Origin": "*",
@@ -126,19 +127,9 @@ Deno.serve(async (req) => {
     }
 
     // --- Rate limit ----------------------------------------------------------
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const { count: recentCalls, error: rateErr } = await admin
-        .from("ai_jobs")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("kind", "generate_flashcards")
-        .gte("created_at", since);
-    if (rateErr) return json({ error: "rate_check_failed" }, 500);
-    if ((recentCalls ?? 0) >= DAILY_RATE_LIMIT) {
-        return json(
-            { error: "rate_limited", retry_after_secs: 24 * 60 * 60 },
-            429,
-        );
+    const rate = await checkDailyJobLimit(admin, userId, JOB_KIND);
+    if (!rate.allowed) {
+        return json(rate.body, rate.status);
     }
 
     // --- Resolve / create the single AI deck for this note -------------------
@@ -200,7 +191,7 @@ Deno.serve(async (req) => {
     // Record the rate-limit row regardless of outcome.
     await admin
         .from("ai_jobs")
-        .insert({ user_id: userId, kind: "generate_flashcards" });
+        .insert({ user_id: userId, kind: JOB_KIND });
 
     // --- Load existing fronts (dedup seed) -----------------------------------
     const seen = new Set<string>();

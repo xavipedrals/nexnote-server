@@ -27,6 +27,10 @@
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import {
+    checkAskAiLimit,
+    recordAskAiMessages,
+} from "../_shared/premium.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -73,6 +77,23 @@ serve(async (req) => {
     if (userErr || !userData?.user) {
         return cors(jsonError(401, "Invalid session"));
     }
+    const userId = userData.user.id;
+
+    const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { persistSession: false },
+    });
+
+    const sanitizedPre = body.messages
+        .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");
+    // One edge invocation = one user send (client appends the user line before calling).
+    const newUserMessages = 1;
+    const askRate = await checkAskAiLimit(admin, userId, body.noteId, newUserMessages);
+    if (!askRate.allowed) {
+        return cors(new Response(JSON.stringify(askRate.body), {
+            status: askRate.status,
+            headers: { "Content-Type": "application/json" },
+        }));
+    }
 
     const { data: note, error: noteErr } = await userClient
         .from("notes")
@@ -91,8 +112,7 @@ serve(async (req) => {
     const lang = note.display_language_code ?? null;
 
     const systemPrompt = buildSystemPrompt(title, summary, lang);
-    const sanitized = body.messages
-        .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    const sanitized = sanitizedPre
         .map((m) => ({ role: m.role, content: m.content }));
 
     const openAiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -117,6 +137,8 @@ serve(async (req) => {
         const errText = await openAiResponse.text().catch(() => "");
         return cors(jsonError(openAiResponse.status || 502, `OpenAI error: ${errText.slice(0, 300)}`));
     }
+
+    await recordAskAiMessages(admin, userId, body.noteId, newUserMessages);
 
     return cors(new Response(openAiResponse.body, {
         status: 200,

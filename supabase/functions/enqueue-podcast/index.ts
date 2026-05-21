@@ -16,13 +16,14 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { checkDailyJobLimit } from "../_shared/premium.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const WORKER_URL = Deno.env.get("WORKER_URL")!;
 const WORKER_SHARED_SECRET = Deno.env.get("WORKER_SHARED_SECRET")!;
 
-const DAILY_RATE_LIMIT = 5; // podcasts per user per 24h
+const JOB_KIND = "podcast";
 const MAX_TARGET_MINUTES = 20;
 const MIN_TARGET_MINUTES = 3;
 
@@ -105,17 +106,9 @@ Deno.serve(async (req) => {
     if (noteErr || !note) return json({ error: "note_not_found" }, 404);
     if (note.user_id !== userId) return json({ error: "forbidden" }, 403);
 
-    // Rate-limit: count podcast jobs in last 24h.
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const { count, error: countErr } = await admin
-        .from("ai_jobs")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("kind", "podcast")
-        .gte("created_at", since);
-    if (countErr) return json({ error: "rate_check_failed" }, 500);
-    if ((count ?? 0) >= DAILY_RATE_LIMIT) {
-        return json({ error: "rate_limited", limit: DAILY_RATE_LIMIT }, 429);
+    const rate = await checkDailyJobLimit(admin, userId, JOB_KIND);
+    if (!rate.allowed) {
+        return json(rate.body, rate.status);
     }
 
     // Insert the podcast row in 'generating' state — the worker will fill in
@@ -136,7 +129,7 @@ Deno.serve(async (req) => {
     }
 
     // Record the rate-limit tick.
-    await admin.from("ai_jobs").insert({ user_id: userId, kind: "podcast" });
+    await admin.from("ai_jobs").insert({ user_id: userId, kind: JOB_KIND });
 
     // Kick the worker. We don't await the body — Cloud Run replies 202 fast
     // and continues processing in the background. waitUntil keeps the request
