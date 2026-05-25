@@ -54,6 +54,19 @@ CREATE TYPE "public"."deck_status" AS ENUM (
 ALTER TYPE "public"."deck_status" OWNER TO "postgres";
 
 
+CREATE TYPE "public"."exam_card_study_state" AS ENUM (
+    'unseen',
+    'learning',
+    'weak',
+    'fragile',
+    'ready',
+    'rescue'
+);
+
+
+ALTER TYPE "public"."exam_card_study_state" OWNER TO "postgres";
+
+
 CREATE TYPE "public"."exam_period" AS ENUM (
     'learning',
     'maintenance',
@@ -63,6 +76,33 @@ CREATE TYPE "public"."exam_period" AS ENUM (
 
 
 ALTER TYPE "public"."exam_period" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."exam_review_context" AS ENUM (
+    'normal',
+    'exam_initial',
+    'immediate_retry',
+    'same_session_delayed_recall',
+    'same_day_delayed_recall',
+    'next_day_recall',
+    'hinted_success',
+    'unsupported_free_recall',
+    'exam_simulation'
+);
+
+
+ALTER TYPE "public"."exam_review_context" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."exam_study_mode" AS ENUM (
+    'normal',
+    'hybrid',
+    'cram',
+    'rescue'
+);
+
+
+ALTER TYPE "public"."exam_study_mode" OWNER TO "postgres";
 
 
 CREATE TYPE "public"."note_report_reason" AS ENUM (
@@ -190,6 +230,28 @@ CREATE TYPE "public"."summary_job_status" AS ENUM (
 ALTER TYPE "public"."summary_job_status" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+    v_user uuid := auth.uid();
+begin
+    if v_user is null then
+        raise exception 'not_authenticated';
+    end if;
+
+    update public.notes n
+    set last_studied_at = greatest(coalesce(n.last_studied_at, '-infinity'::timestamptz), p_studied_at)
+    where n.id = p_note_id
+      and n.user_id = v_user;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_access_note"("p_note_id" "uuid", "p_require_study" boolean DEFAULT false, "p_require_clone" boolean DEFAULT false) RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -245,19 +307,89 @@ begin
   from notes where id = p_note_id
   returning id into new_note_id;
 
-  insert into note_sources (note_id, user_id, kind, status, display_name, sort_order,
-                            storage_path, source_url, mime_type, file_size_bytes,
-                            extracted_text, page_count, duration_secs)
-  select new_note_id, auth.uid(), kind, status, display_name, sort_order,
-         storage_path, source_url, mime_type, file_size_bytes,
-         extracted_text, page_count, duration_secs
+  insert into note_sources (
+    note_id, user_id, kind, status, display_name, sort_order,
+    storage_path, source_url, mime_type, file_size_bytes,
+    extracted_text, page_count, duration_secs
+  )
+  select
+    new_note_id, auth.uid(), kind, status, display_name, sort_order,
+    storage_path, source_url, mime_type, file_size_bytes,
+    extracted_text, page_count, duration_secs
   from note_sources where note_id = p_note_id;
 
   return new_note_id;
-end $$;
+end;
+$$;
 
 
 ALTER FUNCTION "public"."clone_note"("p_note_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_link note_share_links%rowtype;
+  v_user uuid := auth.uid();
+  new_note_id uuid;
+begin
+  if v_user is null then
+    raise exception 'not_authenticated';
+  end if;
+
+  select * into v_link
+  from note_share_links
+  where token = p_token
+    and revoked_at is null
+    and (expires_at is null or expires_at > now())
+    and (max_uses is null or use_count < max_uses);
+
+  if not found then
+    raise exception 'invalid or expired link';
+  end if;
+
+  if not v_link.can_clone then
+    raise exception 'not permitted';
+  end if;
+
+  insert into notes (
+    user_id, folder_id, title, icon, raw_transcript, ai_summary,
+    summary_status, word_count, page_count, display_language_code
+  )
+  select
+    v_user, null, title, icon, raw_transcript, ai_summary,
+    summary_status, word_count, page_count, display_language_code
+  from notes where id = v_link.note_id
+  returning id into new_note_id;
+
+  insert into note_sources (
+    note_id, user_id, kind, status, display_name, sort_order,
+    storage_path, source_url, mime_type, file_size_bytes,
+    extracted_text, page_count, duration_secs
+  )
+  select
+    new_note_id, v_user, kind, status, display_name, sort_order,
+    storage_path, source_url, mime_type, file_size_bytes,
+    extracted_text, page_count, duration_secs
+  from note_sources where note_id = v_link.note_id;
+
+  -- Do not keep study access to the sharer's note after saving a private copy.
+  delete from note_share_link_grants
+  where link_id = v_link.id
+    and user_id = v_user;
+
+  update note_share_links
+  set use_count = use_count + 1
+  where id = v_link.id;
+
+  return new_note_id;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") RETURNS TABLE("flashcard_id" "uuid")
@@ -300,6 +432,59 @@ $$;
 
 
 ALTER FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_exam_engine_cards"("p_exam_id" "uuid") RETURNS TABLE("card_id" "uuid", "deck_id" "uuid", "note_id" "uuid", "note_title" "text", "front" "text", "back" "text", "hint" "text", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer, "exam_state" "public"."exam_card_study_state", "exam_readiness" double precision, "exam_debt" double precision, "exam_priority" double precision, "next_exam_due_at" timestamp with time zone, "last_exam_reviewed_at" timestamp with time zone, "same_day_reps" integer, "total_exam_reps" integer, "recent_failures" integer, "last_exam_rating" "public"."review_rating", "last_review_context" "public"."exam_review_context")
+    LANGUAGE "sql" STABLE
+    AS $$
+    select
+        fc.id as card_id,
+        fc.deck_id,
+        fd.note_id,
+        coalesce(n.title, ''::text) as note_title,
+        fc.front,
+        fc.back,
+        fc.hint,
+        p.state,
+        p.stability,
+        p.difficulty,
+        p.due_at,
+        p.last_reviewed_at,
+        p.elapsed_days,
+        p.scheduled_days,
+        p.step,
+        p.reps,
+        p.lapses,
+        ecp.exam_state,
+        ecp.readiness as exam_readiness,
+        ecp.debt as exam_debt,
+        ecp.priority as exam_priority,
+        ecp.next_exam_due_at,
+        ecp.last_exam_reviewed_at,
+        ecp.same_day_reps,
+        ecp.total_exam_reps,
+        ecp.recent_failures,
+        ecp.last_rating as last_exam_rating,
+        ecp.last_review_context
+    from exam_card_set(p_exam_id) cs
+    join flashcards fc
+      on fc.id = cs.flashcard_id
+    left join flashcard_decks fd
+      on fd.id = fc.deck_id
+    left join notes n
+      on n.id = fd.note_id
+    left join flashcard_progress p
+      on p.flashcard_id = fc.id
+     and p.user_id = auth.uid()
+    left join exam_card_progress ecp
+      on ecp.exam_id = p_exam_id
+     and ecp.flashcard_id = fc.id
+     and ecp.user_id = auth.uid()
+    where coalesce(p.is_suspended, false) = false;
+$$;
+
+
+ALTER FUNCTION "public"."get_exam_engine_cards"("p_exam_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer DEFAULT 20, "p_period" "public"."exam_period" DEFAULT 'maintenance'::"public"."exam_period", "p_new_count" integer DEFAULT 6, "p_exclude_ids" "uuid"[] DEFAULT ARRAY[]::"uuid"[]) RETURNS TABLE("card_id" "uuid", "front" "text", "back" "text", "hint" "text", "bucket" "text", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer, "active_retention" double precision)
@@ -493,6 +678,9 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
                end as bucket
         from enriched
     ),
+
+    -- ── Standard mode (p_allow_ahead = false) ─────────────────────────────
+
     new_quota as (
         select greatest(0, least(p_limit, (p_limit::numeric * p_new_ratio)::int))::int as n
     ),
@@ -516,9 +704,6 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
     new_extra_quota as (
         select greatest(0, p_limit - (select count(*) from combined))::int as n
     ),
-    -- Top up unused slots with more new cards (the 30% ratio still applies
-    -- as the FIRST cut, so a deck with both due+new keeps its mix; only when
-    -- due_pick is short does this kick in).
     new_extra as (
         select * from classified
         where bucket = 'new'
@@ -534,16 +719,58 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
     ahead_quota as (
         select greatest(0, p_limit - (select count(*) from combined_with_new))::int as n
     ),
-    ahead_pick as (
+    ahead_pick_standard as (
         select * from classified
         where bucket = 'ahead' and p_allow_ahead
         order by due_at asc
         limit (select n from ahead_quota)
     ),
-    final as (
+    standard_final as (
         select * from combined_with_new
         union all
-        select * from ahead_pick
+        select * from ahead_pick_standard
+    ),
+
+    -- ── Study-ahead mode (p_allow_ahead = true) ───────────────────────────
+    -- Up to p_limit due (if any remain), plus p_limit ahead (closest future
+    -- due) and p_limit new — independent quotas, not sharing one cap.
+
+    due_pick_ahead as (
+        select * from classified
+        where bucket = 'due'
+        order by due_at asc
+        limit p_limit
+    ),
+    ahead_pick_ahead as (
+        select * from classified
+        where bucket = 'ahead'
+        order by due_at asc
+        limit p_limit
+    ),
+    picked_before_new_ahead as (
+        select card_id from due_pick_ahead
+        union
+        select card_id from ahead_pick_ahead
+    ),
+    new_pick_ahead as (
+        select * from classified
+        where bucket = 'new'
+          and card_id not in (select card_id from picked_before_new_ahead)
+        order by random()
+        limit p_limit
+    ),
+    ahead_mode_final as (
+        select * from due_pick_ahead
+        union all
+        select * from ahead_pick_ahead
+        union all
+        select * from new_pick_ahead
+    ),
+
+    final as (
+        select * from ahead_mode_final where p_allow_ahead
+        union all
+        select * from standard_final where not p_allow_ahead
     )
     select card_id, front, back, hint, bucket,
            state, stability, difficulty,
@@ -646,49 +873,118 @@ $$;
 ALTER FUNCTION "public"."get_study_session"("p_deck_id" "uuid", "p_limit" integer, "p_new_ratio" numeric) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+CREATE OR REPLACE FUNCTION "public"."record_exam_review"("p_exam_id" "uuid", "p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_review_context" "public"."exam_review_context", "p_exam_state_after" "public"."exam_card_study_state", "p_readiness_after" double precision, "p_debt_after" double precision, "p_priority_after" double precision, "p_same_day_reps" integer, "p_recent_failures" integer, "p_step" smallint DEFAULT 0, "p_state_before" "public"."card_state" DEFAULT NULL::"public"."card_state", "p_stability_before" double precision DEFAULT NULL::double precision, "p_difficulty_before" double precision DEFAULT NULL::double precision, "p_elapsed_days" integer DEFAULT NULL::integer, "p_review_duration_ms" integer DEFAULT NULL::integer, "p_next_exam_due_at" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_exam_state_before" "public"."exam_card_study_state" DEFAULT NULL::"public"."exam_card_study_state", "p_readiness_before" double precision DEFAULT NULL::double precision, "p_debt_before" double precision DEFAULT NULL::double precision, "p_study_date" "date" DEFAULT NULL::"date") RETURNS "void"
+    LANGUAGE "plpgsql"
     AS $$
 declare
-    v_user uuid := auth.uid();
+    v_user   uuid        := auth.uid();
+    v_now    timestamptz := now();
+    v_lapsed boolean     := (p_rating = 'again');
+    v_study_date date    := coalesce(p_study_date, current_date);
 begin
     if v_user is null then
         raise exception 'not_authenticated';
     end if;
 
-    update public.notes n
-    set last_studied_at = greatest(coalesce(n.last_studied_at, '-infinity'::timestamptz), p_studied_at)
-    where n.id = p_note_id
-      and n.user_id = v_user;
+    if not exists (
+        select 1
+        from exam_card_set(p_exam_id) cs
+        where cs.flashcard_id = p_card_id
+    ) then
+        raise exception 'card_not_in_exam';
+    end if;
+
+    insert into flashcard_progress (
+        flashcard_id, user_id,
+        stability, difficulty, state, step,
+        due_at, last_reviewed_at,
+        elapsed_days, scheduled_days,
+        reps, lapses, last_rating
+    ) values (
+        p_card_id, v_user,
+        p_stability_after, p_difficulty_after, p_state_after, coalesce(p_step, 0),
+        p_due_at, v_now,
+        coalesce(p_elapsed_days, 0), p_scheduled_days,
+        1, case when v_lapsed then 1 else 0 end, p_rating
+    )
+    on conflict (flashcard_id, user_id) do update set
+        stability        = excluded.stability,
+        difficulty       = excluded.difficulty,
+        state            = excluded.state,
+        step             = excluded.step,
+        due_at           = excluded.due_at,
+        last_reviewed_at = excluded.last_reviewed_at,
+        elapsed_days     = excluded.elapsed_days,
+        scheduled_days   = excluded.scheduled_days,
+        reps             = flashcard_progress.reps + 1,
+        lapses           = flashcard_progress.lapses + case when v_lapsed then 1 else 0 end,
+        last_rating      = excluded.last_rating;
+
+    insert into flashcard_reviews (
+        flashcard_id, user_id, rating,
+        state_before, stability_before, difficulty_before, elapsed_days,
+        stability_after, difficulty_after, scheduled_days,
+        review_duration_ms, reviewed_at
+    ) values (
+        p_card_id, v_user, p_rating,
+        p_state_before, p_stability_before, p_difficulty_before, p_elapsed_days,
+        p_stability_after, p_difficulty_after, p_scheduled_days,
+        p_review_duration_ms, v_now
+    );
+
+    insert into exam_card_progress (
+        exam_id, flashcard_id, user_id,
+        exam_state, readiness, debt, priority,
+        next_exam_due_at, last_exam_reviewed_at,
+        same_day_reps, total_exam_reps, recent_failures,
+        last_rating, last_review_context
+    ) values (
+        p_exam_id, p_card_id, v_user,
+        p_exam_state_after, p_readiness_after, p_debt_after, p_priority_after,
+        p_next_exam_due_at, v_now,
+        greatest(0, p_same_day_reps), 1, greatest(0, p_recent_failures),
+        p_rating, p_review_context
+    )
+    on conflict (exam_id, flashcard_id, user_id) do update set
+        exam_state            = excluded.exam_state,
+        readiness             = excluded.readiness,
+        debt                  = excluded.debt,
+        priority              = excluded.priority,
+        next_exam_due_at      = excluded.next_exam_due_at,
+        last_exam_reviewed_at = excluded.last_exam_reviewed_at,
+        same_day_reps         = excluded.same_day_reps,
+        total_exam_reps       = exam_card_progress.total_exam_reps + 1,
+        recent_failures       = excluded.recent_failures,
+        last_rating           = excluded.last_rating,
+        last_review_context   = excluded.last_review_context;
+
+    insert into exam_review_events (
+        exam_id, flashcard_id, user_id, rating, review_context,
+        exam_state_before, exam_state_after,
+        readiness_before, readiness_after,
+        debt_before, debt_after,
+        priority_after, review_duration_ms, reviewed_at
+    ) values (
+        p_exam_id, p_card_id, v_user, p_rating, p_review_context,
+        p_exam_state_before, p_exam_state_after,
+        p_readiness_before, p_readiness_after,
+        p_debt_before, p_debt_after,
+        p_priority_after, p_review_duration_ms, v_now
+    );
+
+    insert into exam_daily_progress (
+        exam_id, user_id, study_date, completed_reviews
+    ) values (
+        p_exam_id, v_user, v_study_date, 1
+    )
+    on conflict (exam_id, user_id, study_date) do update set
+        completed_reviews = exam_daily_progress.completed_reviews + 1,
+        updated_at = v_now;
 end;
 $$;
 
 
-ALTER FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
-    AS $$
-declare
-    v_user uuid := auth.uid();
-begin
-    if v_user is null then
-        raise exception 'not_authenticated';
-    end if;
-
-    if not public.can_access_note(p_note_id, p_require_study => true) then
-        raise exception 'forbidden';
-    end if;
-
-    perform public.bump_note_last_studied(p_note_id, now());
-end;
-$$;
-
-
-ALTER FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."record_exam_review"("p_exam_id" "uuid", "p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_review_context" "public"."exam_review_context", "p_exam_state_after" "public"."exam_card_study_state", "p_readiness_after" double precision, "p_debt_after" double precision, "p_priority_after" double precision, "p_same_day_reps" integer, "p_recent_failures" integer, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer, "p_next_exam_due_at" timestamp with time zone, "p_exam_state_before" "public"."exam_card_study_state", "p_readiness_before" double precision, "p_debt_before" double precision, "p_study_date" "date") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_step" smallint DEFAULT 0, "p_state_before" "public"."card_state" DEFAULT NULL::"public"."card_state", "p_stability_before" double precision DEFAULT NULL::double precision, "p_difficulty_before" double precision DEFAULT NULL::double precision, "p_elapsed_days" integer DEFAULT NULL::integer, "p_review_duration_ms" integer DEFAULT NULL::integer) RETURNS "void"
@@ -790,67 +1086,6 @@ end $$;
 ALTER FUNCTION "public"."redeem_share_link"("p_token" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") RETURNS "uuid"
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
-    AS $$
-declare
-  v_link note_share_links%rowtype;
-  v_user uuid := auth.uid();
-  new_note_id uuid;
-begin
-  if v_user is null then
-    raise exception 'not_authenticated';
-  end if;
-
-  select * into v_link
-  from note_share_links
-  where token = p_token
-    and revoked_at is null
-    and (expires_at is null or expires_at > now())
-    and (max_uses is null or use_count < max_uses);
-
-  if not found then
-    raise exception 'invalid or expired link';
-  end if;
-
-  if not v_link.can_clone then
-    raise exception 'not permitted';
-  end if;
-
-  insert into notes (
-    user_id, folder_id, title, icon, raw_transcript, ai_summary,
-    summary_status, word_count, page_count, display_language_code
-  )
-  select
-    v_user, null, title, icon, raw_transcript, ai_summary,
-    summary_status, word_count, page_count, display_language_code
-  from notes where id = v_link.note_id
-  returning id into new_note_id;
-
-  insert into note_sources (note_id, user_id, kind, status, display_name, sort_order,
-                            storage_path, source_url, mime_type, file_size_bytes,
-                            extracted_text, page_count, duration_secs)
-  select new_note_id, v_user, kind, status, display_name, sort_order,
-         storage_path, source_url, mime_type, file_size_bytes,
-         extracted_text, page_count, duration_secs
-  from note_sources where note_id = v_link.note_id;
-
-  delete from note_share_link_grants
-  where link_id = v_link.id
-    and user_id = v_user;
-
-  update note_share_links
-  set use_count = use_count + 1
-  where id = v_link.id;
-
-  return new_note_id;
-end $$;
-
-
-ALTER FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") OWNER TO "postgres";
-
-
 CREATE OR REPLACE FUNCTION "public"."rls_auto_enable"() RETURNS "event_trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'pg_catalog'
@@ -896,6 +1131,76 @@ $$;
 ALTER FUNCTION "public"."set_updated_at"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+    v_user uuid := auth.uid();
+begin
+    if v_user is null then
+        raise exception 'not_authenticated';
+    end if;
+
+    if not public.can_access_note(p_note_id, p_require_study => true) then
+        raise exception 'forbidden';
+    end if;
+
+    perform public.bump_note_last_studied(p_note_id, now());
+end;
+$$;
+
+
+ALTER FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trg_quiz_attempt_bump_note_last_studied"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+    v_note_id uuid;
+begin
+    if new.completed_at is null then
+        return new;
+    end if;
+
+    select q.note_id into v_note_id
+    from public.quizzes q
+    where q.id = new.quiz_id;
+
+    if v_note_id is not null then
+        perform public.bump_note_last_studied(v_note_id, new.completed_at);
+    end if;
+
+    return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."trg_quiz_attempt_bump_note_last_studied"() OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."ab_experiments" (
+    "key" "text" NOT NULL,
+    "enabled" boolean DEFAULT true NOT NULL,
+    "variants" "jsonb" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "ab_experiments_variants_is_array" CHECK (("jsonb_typeof"("variants") = 'array'::"text"))
+);
+
+
+ALTER TABLE "public"."ab_experiments" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."ab_experiments" IS 'A/B experiment registry. SELECT is public; edits via dashboard / service role only.';
+
+
+
+COMMENT ON COLUMN "public"."ab_experiments"."variants" IS 'Array of {"id": string, "weight": int, "config": object}. Weights are relative within the experiment.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."ai_jobs" (
     "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -905,6 +1210,137 @@ CREATE TABLE IF NOT EXISTS "public"."ai_jobs" (
 
 
 ALTER TABLE "public"."ai_jobs" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."app_config" (
+    "key" "text" NOT NULL,
+    "value" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "app_config_key_format" CHECK (("key" ~ '^[a-z][a-z0-9_]*$'::"text"))
+);
+
+
+ALTER TABLE "public"."app_config" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."app_config" IS 'Key-value app settings. SELECT is public; edits via dashboard / service role only.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."exam_card_progress" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "exam_id" "uuid" NOT NULL,
+    "flashcard_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "exam_state" "public"."exam_card_study_state" DEFAULT 'unseen'::"public"."exam_card_study_state" NOT NULL,
+    "readiness" double precision DEFAULT 0 NOT NULL,
+    "debt" double precision DEFAULT 0 NOT NULL,
+    "priority" double precision DEFAULT 0 NOT NULL,
+    "next_exam_due_at" timestamp with time zone,
+    "last_exam_reviewed_at" timestamp with time zone,
+    "same_day_reps" integer DEFAULT 0 NOT NULL,
+    "total_exam_reps" integer DEFAULT 0 NOT NULL,
+    "recent_failures" integer DEFAULT 0 NOT NULL,
+    "last_rating" "public"."review_rating",
+    "last_review_context" "public"."exam_review_context",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "exam_card_progress_debt_check" CHECK (("debt" >= (0)::double precision)),
+    CONSTRAINT "exam_card_progress_readiness_check" CHECK ((("readiness" >= (0)::double precision) AND ("readiness" <= (1)::double precision))),
+    CONSTRAINT "exam_card_progress_recent_failures_check" CHECK (("recent_failures" >= 0)),
+    CONSTRAINT "exam_card_progress_same_day_reps_check" CHECK (("same_day_reps" >= 0)),
+    CONSTRAINT "exam_card_progress_total_exam_reps_check" CHECK (("total_exam_reps" >= 0))
+);
+
+
+ALTER TABLE "public"."exam_card_progress" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."exam_daily_progress" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "exam_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "study_date" "date" NOT NULL,
+    "raw_target" integer DEFAULT 0 NOT NULL,
+    "displayed_target" integer DEFAULT 0 NOT NULL,
+    "completed_reviews" integer DEFAULT 0 NOT NULL,
+    "readiness" double precision DEFAULT 0 NOT NULL,
+    "mode" "public"."exam_study_mode" DEFAULT 'normal'::"public"."exam_study_mode" NOT NULL,
+    "status" "text" DEFAULT 'onTrack'::"text" NOT NULL,
+    "forecast_snapshot" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "exam_daily_progress_completed_reviews_check" CHECK (("completed_reviews" >= 0)),
+    CONSTRAINT "exam_daily_progress_displayed_target_check" CHECK (("displayed_target" >= 0)),
+    CONSTRAINT "exam_daily_progress_raw_target_check" CHECK (("raw_target" >= 0)),
+    CONSTRAINT "exam_daily_progress_readiness_check" CHECK ((("readiness" >= (0)::double precision) AND ("readiness" <= (1)::double precision)))
+);
+
+
+ALTER TABLE "public"."exam_daily_progress" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."exam_forecast_revisions" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "exam_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "source" "text" DEFAULT 'app'::"text" NOT NULL,
+    "raw_today_target" integer DEFAULT 0 NOT NULL,
+    "displayed_target" integer DEFAULT 0 NOT NULL,
+    "readiness" double precision DEFAULT 0 NOT NULL,
+    "mode" "public"."exam_study_mode" DEFAULT 'normal'::"public"."exam_study_mode" NOT NULL,
+    "forecast" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    CONSTRAINT "exam_forecast_revisions_displayed_target_check" CHECK (("displayed_target" >= 0)),
+    CONSTRAINT "exam_forecast_revisions_raw_today_target_check" CHECK (("raw_today_target" >= 0)),
+    CONSTRAINT "exam_forecast_revisions_readiness_check" CHECK ((("readiness" >= (0)::double precision) AND ("readiness" <= (1)::double precision)))
+);
+
+
+ALTER TABLE "public"."exam_forecast_revisions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."exam_review_events" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "exam_id" "uuid" NOT NULL,
+    "flashcard_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "rating" "public"."review_rating" NOT NULL,
+    "review_context" "public"."exam_review_context" DEFAULT 'normal'::"public"."exam_review_context" NOT NULL,
+    "exam_state_before" "public"."exam_card_study_state",
+    "exam_state_after" "public"."exam_card_study_state" NOT NULL,
+    "readiness_before" double precision,
+    "readiness_after" double precision NOT NULL,
+    "debt_before" double precision,
+    "debt_after" double precision NOT NULL,
+    "priority_after" double precision DEFAULT 0 NOT NULL,
+    "review_duration_ms" integer,
+    "reviewed_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "exam_review_events_debt_after_check" CHECK (("debt_after" >= (0)::double precision)),
+    CONSTRAINT "exam_review_events_readiness_after_check" CHECK ((("readiness_after" >= (0)::double precision) AND ("readiness_after" <= (1)::double precision)))
+);
+
+
+ALTER TABLE "public"."exam_review_events" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."exam_sessions" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "exam_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "ended_at" timestamp with time zone,
+    "duration_secs" integer DEFAULT 0 NOT NULL,
+    "cards_reviewed" integer DEFAULT 0 NOT NULL,
+    "mode" "public"."exam_study_mode" DEFAULT 'normal'::"public"."exam_study_mode" NOT NULL,
+    "strategy" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "exam_sessions_cards_reviewed_check" CHECK (("cards_reviewed" >= 0)),
+    CONSTRAINT "exam_sessions_duration_secs_check" CHECK (("duration_secs" >= 0))
+);
+
+
+ALTER TABLE "public"."exam_sessions" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."exams" (
@@ -1033,13 +1469,17 @@ CREATE TABLE IF NOT EXISTS "public"."folders" (
     "icon" "text",
     "color" "text",
     "sort_order" integer DEFAULT 0 NOT NULL,
-    "exam_date_prompt_collapsed" boolean DEFAULT false NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "exam_date_prompt_collapsed" boolean DEFAULT false NOT NULL
 );
 
 
 ALTER TABLE "public"."folders" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."folders"."exam_date_prompt_collapsed" IS 'When true, the notes list shows the compact exam prompt (Activate exam mode toggle) instead of the full card.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."note_reports" (
@@ -1143,9 +1583,9 @@ CREATE TABLE IF NOT EXISTS "public"."notes" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_opened_at" timestamp with time zone,
-    "last_studied_at" timestamp with time zone,
     "display_language_code" "text",
-    "summary_error" "text"
+    "summary_error" "text",
+    "last_studied_at" timestamp with time zone
 );
 
 
@@ -1153,6 +1593,48 @@ ALTER TABLE "public"."notes" OWNER TO "postgres";
 
 
 COMMENT ON COLUMN "public"."notes"."display_language_code" IS 'ISO 639-1 code for the language ai_summary is currently written in. Set by translate-summary and read by generate-flashcards / generate-quiz / generate-podcast so generated content matches.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."onboarding_dropoffs" (
+    "id" "uuid" DEFAULT "public"."uuidv7"() NOT NULL,
+    "install_id" "text" NOT NULL,
+    "session_id" "text" NOT NULL,
+    "flow_version" "text" NOT NULL,
+    "experiment_variant" "text",
+    "dropped_at_step" "text" NOT NULL,
+    "last_answered_step" "text",
+    "steps_reached" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "answers" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "app_version" "text",
+    "locale" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."onboarding_dropoffs" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."onboarding_dropoffs" IS 'Pre-auth onboarding exits. Written only by record-onboarding-dropoff (service role).';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."onboarding_stats" (
+    "user_id" "uuid" NOT NULL,
+    "flow_version" "text" NOT NULL,
+    "experiment_variant" "text",
+    "answers" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "steps_reached" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "completed_at" timestamp with time zone NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."onboarding_stats" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."onboarding_stats" IS 'Completed onboarding Q&A linked to an authenticated user.';
 
 
 
@@ -1312,8 +1794,53 @@ CREATE TABLE IF NOT EXISTS "public"."user_push_devices" (
 ALTER TABLE "public"."user_push_devices" OWNER TO "postgres";
 
 
+ALTER TABLE ONLY "public"."ab_experiments"
+    ADD CONSTRAINT "ab_experiments_pkey" PRIMARY KEY ("key");
+
+
+
 ALTER TABLE ONLY "public"."ai_jobs"
     ADD CONSTRAINT "ai_jobs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."app_config"
+    ADD CONSTRAINT "app_config_pkey" PRIMARY KEY ("key");
+
+
+
+ALTER TABLE ONLY "public"."exam_card_progress"
+    ADD CONSTRAINT "exam_card_progress_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."exam_card_progress"
+    ADD CONSTRAINT "exam_card_progress_unique" UNIQUE ("exam_id", "flashcard_id", "user_id");
+
+
+
+ALTER TABLE ONLY "public"."exam_daily_progress"
+    ADD CONSTRAINT "exam_daily_progress_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."exam_daily_progress"
+    ADD CONSTRAINT "exam_daily_progress_unique" UNIQUE ("exam_id", "user_id", "study_date");
+
+
+
+ALTER TABLE ONLY "public"."exam_forecast_revisions"
+    ADD CONSTRAINT "exam_forecast_revisions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."exam_review_events"
+    ADD CONSTRAINT "exam_review_events_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."exam_sessions"
+    ADD CONSTRAINT "exam_sessions_pkey" PRIMARY KEY ("id");
 
 
 
@@ -1407,6 +1934,16 @@ ALTER TABLE ONLY "public"."notes"
 
 
 
+ALTER TABLE ONLY "public"."onboarding_dropoffs"
+    ADD CONSTRAINT "onboarding_dropoffs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."onboarding_stats"
+    ADD CONSTRAINT "onboarding_stats_pkey" PRIMARY KEY ("user_id");
+
+
+
 ALTER TABLE ONLY "public"."podcasts"
     ADD CONSTRAINT "podcasts_pkey" PRIMARY KEY ("id");
 
@@ -1473,6 +2010,38 @@ ALTER TABLE ONLY "public"."user_push_devices"
 
 
 CREATE INDEX "ai_jobs_user_kind_created" ON "public"."ai_jobs" USING "btree" ("user_id", "kind", "created_at" DESC);
+
+
+
+CREATE INDEX "exam_card_progress_due_priority_idx" ON "public"."exam_card_progress" USING "btree" ("exam_id", "user_id", "next_exam_due_at", "priority" DESC);
+
+
+
+CREATE INDEX "exam_card_progress_exam_user_idx" ON "public"."exam_card_progress" USING "btree" ("exam_id", "user_id");
+
+
+
+CREATE INDEX "exam_card_progress_state_idx" ON "public"."exam_card_progress" USING "btree" ("exam_id", "user_id", "exam_state");
+
+
+
+CREATE INDEX "exam_daily_progress_exam_user_date_idx" ON "public"."exam_daily_progress" USING "btree" ("exam_id", "user_id", "study_date" DESC);
+
+
+
+CREATE INDEX "exam_forecast_revisions_exam_user_created_idx" ON "public"."exam_forecast_revisions" USING "btree" ("exam_id", "user_id", "created_at" DESC);
+
+
+
+CREATE INDEX "exam_review_events_card_idx" ON "public"."exam_review_events" USING "btree" ("flashcard_id", "user_id", "reviewed_at" DESC);
+
+
+
+CREATE INDEX "exam_review_events_exam_user_reviewed_idx" ON "public"."exam_review_events" USING "btree" ("exam_id", "user_id", "reviewed_at" DESC);
+
+
+
+CREATE INDEX "exam_sessions_exam_user_started_idx" ON "public"."exam_sessions" USING "btree" ("exam_id", "user_id", "started_at" DESC);
 
 
 
@@ -1568,6 +2137,22 @@ CREATE INDEX "notes_user_id_last_studied_at_idx" ON "public"."notes" USING "btre
 
 
 
+CREATE INDEX "onboarding_dropoffs_created_at_idx" ON "public"."onboarding_dropoffs" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "onboarding_dropoffs_dropped_at_step_idx" ON "public"."onboarding_dropoffs" USING "btree" ("dropped_at_step");
+
+
+
+CREATE INDEX "onboarding_dropoffs_install_id_idx" ON "public"."onboarding_dropoffs" USING "btree" ("install_id");
+
+
+
+CREATE UNIQUE INDEX "onboarding_dropoffs_session_id_key" ON "public"."onboarding_dropoffs" USING "btree" ("session_id");
+
+
+
 CREATE INDEX "podcasts_note_id_idx" ON "public"."podcasts" USING "btree" ("note_id");
 
 
@@ -1620,7 +2205,19 @@ CREATE INDEX "user_push_devices_user_id_idx" ON "public"."user_push_devices" USI
 
 
 
+CREATE OR REPLACE TRIGGER "quiz_attempts_bump_note_last_studied" AFTER INSERT ON "public"."quiz_attempts" FOR EACH ROW EXECUTE FUNCTION "public"."trg_quiz_attempt_bump_note_last_studied"();
+
+
+
 CREATE OR REPLACE TRIGGER "summary_jobs_set_updated_at" BEFORE UPDATE ON "public"."summary_jobs" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "t_exam_card_progress_updated" BEFORE UPDATE ON "public"."exam_card_progress" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "t_exam_daily_progress_updated" BEFORE UPDATE ON "public"."exam_daily_progress" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -1654,6 +2251,66 @@ CREATE OR REPLACE TRIGGER "t_profiles_updated" BEFORE UPDATE ON "public"."profil
 
 ALTER TABLE ONLY "public"."ai_jobs"
     ADD CONSTRAINT "ai_jobs_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_card_progress"
+    ADD CONSTRAINT "exam_card_progress_exam_id_fkey" FOREIGN KEY ("exam_id") REFERENCES "public"."exams"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_card_progress"
+    ADD CONSTRAINT "exam_card_progress_flashcard_id_fkey" FOREIGN KEY ("flashcard_id") REFERENCES "public"."flashcards"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_card_progress"
+    ADD CONSTRAINT "exam_card_progress_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_daily_progress"
+    ADD CONSTRAINT "exam_daily_progress_exam_id_fkey" FOREIGN KEY ("exam_id") REFERENCES "public"."exams"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_daily_progress"
+    ADD CONSTRAINT "exam_daily_progress_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_forecast_revisions"
+    ADD CONSTRAINT "exam_forecast_revisions_exam_id_fkey" FOREIGN KEY ("exam_id") REFERENCES "public"."exams"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_forecast_revisions"
+    ADD CONSTRAINT "exam_forecast_revisions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_review_events"
+    ADD CONSTRAINT "exam_review_events_exam_id_fkey" FOREIGN KEY ("exam_id") REFERENCES "public"."exams"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_review_events"
+    ADD CONSTRAINT "exam_review_events_flashcard_id_fkey" FOREIGN KEY ("flashcard_id") REFERENCES "public"."flashcards"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_review_events"
+    ADD CONSTRAINT "exam_review_events_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_sessions"
+    ADD CONSTRAINT "exam_sessions_exam_id_fkey" FOREIGN KEY ("exam_id") REFERENCES "public"."exams"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."exam_sessions"
+    ADD CONSTRAINT "exam_sessions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -1782,6 +2439,11 @@ ALTER TABLE ONLY "public"."notes"
 
 
 
+ALTER TABLE ONLY "public"."onboarding_stats"
+    ADD CONSTRAINT "onboarding_stats_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."podcasts"
     ADD CONSTRAINT "podcasts_note_id_fkey" FOREIGN KEY ("note_id") REFERENCES "public"."notes"("id") ON DELETE CASCADE;
 
@@ -1867,10 +2529,24 @@ ALTER TABLE ONLY "public"."user_push_devices"
 
 
 
+ALTER TABLE "public"."ab_experiments" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "ab_experiments select public" ON "public"."ab_experiments" FOR SELECT TO "authenticated", "anon" USING (true);
+
+
+
 ALTER TABLE "public"."ai_jobs" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "ai_jobs self read" ON "public"."ai_jobs" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."app_config" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "app_config select public" ON "public"."app_config" FOR SELECT TO "authenticated", "anon" USING (true);
 
 
 
@@ -1898,6 +2574,93 @@ CREATE POLICY "decks select" ON "public"."flashcard_decks" FOR SELECT USING ("pu
 
 CREATE POLICY "decks write" ON "public"."flashcard_decks" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
 
+
+
+CREATE POLICY "exam card progress self delete" ON "public"."exam_card_progress" FOR DELETE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam card progress self insert" ON "public"."exam_card_progress" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam card progress self select" ON "public"."exam_card_progress" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam card progress self update" ON "public"."exam_card_progress" FOR UPDATE USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam daily progress self delete" ON "public"."exam_daily_progress" FOR DELETE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam daily progress self insert" ON "public"."exam_daily_progress" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam daily progress self select" ON "public"."exam_daily_progress" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam daily progress self update" ON "public"."exam_daily_progress" FOR UPDATE USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam forecast revisions self delete" ON "public"."exam_forecast_revisions" FOR DELETE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam forecast revisions self insert" ON "public"."exam_forecast_revisions" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam forecast revisions self select" ON "public"."exam_forecast_revisions" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam review events self delete" ON "public"."exam_review_events" FOR DELETE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam review events self insert" ON "public"."exam_review_events" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam review events self select" ON "public"."exam_review_events" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam sessions self delete" ON "public"."exam_sessions" FOR DELETE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam sessions self insert" ON "public"."exam_sessions" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam sessions self select" ON "public"."exam_sessions" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "exam sessions self update" ON "public"."exam_sessions" FOR UPDATE USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."exam_card_progress" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."exam_daily_progress" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."exam_forecast_revisions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."exam_review_events" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."exam_sessions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."exams" ENABLE ROW LEVEL SECURITY;
@@ -1984,6 +2747,24 @@ CREATE POLICY "notes select" ON "public"."notes" FOR SELECT USING ("public"."can
 
 
 CREATE POLICY "notes write" ON "public"."notes" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."onboarding_dropoffs" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."onboarding_stats" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "onboarding_stats insert own" ON "public"."onboarding_stats" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "onboarding_stats select own" ON "public"."onboarding_stats" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "onboarding_stats update own" ON "public"."onboarding_stats" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
 
 
 
@@ -2215,6 +2996,12 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."bump_note_last_studied"("p_note_id" "uuid", "p_studied_at" timestamp with time zone) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."can_access_note"("p_note_id" "uuid", "p_require_study" boolean, "p_require_clone" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."can_access_note"("p_note_id" "uuid", "p_require_study" boolean, "p_require_clone" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_access_note"("p_note_id" "uuid", "p_require_study" boolean, "p_require_clone" boolean) TO "service_role";
@@ -2227,6 +3014,12 @@ GRANT ALL ON FUNCTION "public"."clone_note"("p_note_id" "uuid") TO "service_role
 
 
 
+GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "service_role";
@@ -2236,6 +3029,12 @@ GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "service_r
 GRANT ALL ON FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_exam_engine_cards"("p_exam_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_exam_engine_cards"("p_exam_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_exam_engine_cards"("p_exam_id" "uuid") TO "service_role";
 
 
 
@@ -2275,6 +3074,12 @@ GRANT ALL ON FUNCTION "public"."get_study_session"("p_deck_id" "uuid", "p_limit"
 
 
 
+GRANT ALL ON FUNCTION "public"."record_exam_review"("p_exam_id" "uuid", "p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_review_context" "public"."exam_review_context", "p_exam_state_after" "public"."exam_card_study_state", "p_readiness_after" double precision, "p_debt_after" double precision, "p_priority_after" double precision, "p_same_day_reps" integer, "p_recent_failures" integer, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer, "p_next_exam_due_at" timestamp with time zone, "p_exam_state_before" "public"."exam_card_study_state", "p_readiness_before" double precision, "p_debt_before" double precision, "p_study_date" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."record_exam_review"("p_exam_id" "uuid", "p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_review_context" "public"."exam_review_context", "p_exam_state_after" "public"."exam_card_study_state", "p_readiness_after" double precision, "p_debt_after" double precision, "p_priority_after" double precision, "p_same_day_reps" integer, "p_recent_failures" integer, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer, "p_next_exam_due_at" timestamp with time zone, "p_exam_state_before" "public"."exam_card_study_state", "p_readiness_before" double precision, "p_debt_before" double precision, "p_study_date" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."record_exam_review"("p_exam_id" "uuid", "p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_review_context" "public"."exam_review_context", "p_exam_state_after" "public"."exam_card_study_state", "p_readiness_after" double precision, "p_debt_after" double precision, "p_priority_after" double precision, "p_same_day_reps" integer, "p_recent_failures" integer, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer, "p_next_exam_due_at" timestamp with time zone, "p_exam_state_before" "public"."exam_card_study_state", "p_readiness_before" double precision, "p_debt_before" double precision, "p_study_date" "date") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "public"."review_rating", "p_state_after" "public"."card_state", "p_stability_after" double precision, "p_difficulty_after" double precision, "p_scheduled_days" integer, "p_due_at" timestamp with time zone, "p_step" smallint, "p_state_before" "public"."card_state", "p_stability_before" double precision, "p_difficulty_before" double precision, "p_elapsed_days" integer, "p_review_duration_ms" integer) TO "service_role";
@@ -2284,12 +3089,6 @@ GRANT ALL ON FUNCTION "public"."record_review"("p_card_id" "uuid", "p_rating" "p
 GRANT ALL ON FUNCTION "public"."redeem_share_link"("p_token" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."redeem_share_link"("p_token" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."redeem_share_link"("p_token" "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") TO "service_role";
 
 
 
@@ -2305,9 +3104,63 @@ GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."trg_quiz_attempt_bump_note_last_studied"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_quiz_attempt_bump_note_last_studied"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_quiz_attempt_bump_note_last_studied"() TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."ab_experiments" TO "anon";
+GRANT ALL ON TABLE "public"."ab_experiments" TO "authenticated";
+GRANT ALL ON TABLE "public"."ab_experiments" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."ai_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."ai_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."ai_jobs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."app_config" TO "anon";
+GRANT ALL ON TABLE "public"."app_config" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_config" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."exam_card_progress" TO "anon";
+GRANT ALL ON TABLE "public"."exam_card_progress" TO "authenticated";
+GRANT ALL ON TABLE "public"."exam_card_progress" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."exam_daily_progress" TO "anon";
+GRANT ALL ON TABLE "public"."exam_daily_progress" TO "authenticated";
+GRANT ALL ON TABLE "public"."exam_daily_progress" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."exam_forecast_revisions" TO "anon";
+GRANT ALL ON TABLE "public"."exam_forecast_revisions" TO "authenticated";
+GRANT ALL ON TABLE "public"."exam_forecast_revisions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."exam_review_events" TO "anon";
+GRANT ALL ON TABLE "public"."exam_review_events" TO "authenticated";
+GRANT ALL ON TABLE "public"."exam_review_events" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."exam_sessions" TO "anon";
+GRANT ALL ON TABLE "public"."exam_sessions" TO "authenticated";
+GRANT ALL ON TABLE "public"."exam_sessions" TO "service_role";
 
 
 
@@ -2386,6 +3239,18 @@ GRANT ALL ON TABLE "public"."note_sources" TO "service_role";
 GRANT ALL ON TABLE "public"."notes" TO "anon";
 GRANT ALL ON TABLE "public"."notes" TO "authenticated";
 GRANT ALL ON TABLE "public"."notes" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."onboarding_dropoffs" TO "anon";
+GRANT ALL ON TABLE "public"."onboarding_dropoffs" TO "authenticated";
+GRANT ALL ON TABLE "public"."onboarding_dropoffs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."onboarding_stats" TO "anon";
+GRANT ALL ON TABLE "public"."onboarding_stats" TO "authenticated";
+GRANT ALL ON TABLE "public"."onboarding_stats" TO "service_role";
 
 
 
