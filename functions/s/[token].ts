@@ -114,8 +114,10 @@ function renderSharedNote(note: SharedNote, token: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 200);
-  const safePreview = escapeHtml(previewText || "Shared with NexNote");
-  const reportHref = `/report?token=${encodeURIComponent(token)}`;
+  const safePreview = escapeHtml(previewText || "Shared with NuNotes");
+  const reportHref =
+    `/report?token=${encodeURIComponent(token)}` +
+    `&noteId=${encodeURIComponent(note.noteId)}`;
   const langAttr = note.displayLanguageCode
     ? ` lang="${escapeHtml(note.displayLanguageCode)}"`
     : "";
@@ -125,7 +127,7 @@ function renderSharedNote(note: SharedNote, token: string): string {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${safeTitle} — NexNote</title>
+<title>${safeTitle} — NuNotes</title>
 <meta name="description" content="${safePreview}">
 <meta property="og:title" content="${safeTitle}">
 <meta property="og:description" content="${safePreview}">
@@ -143,7 +145,7 @@ function renderSharedNote(note: SharedNote, token: string): string {
 
 <nav class="nav">
   <div class="container nav-inner">
-    <a href="/" class="nav-logo">NexNote</a>
+    <a href="/" class="nav-logo">NuNotes</a>
     <div class="nav-links">
       <a href="/#download" class="btn btn-primary">Get the app</a>
     </div>
@@ -154,9 +156,9 @@ function renderSharedNote(note: SharedNote, token: string): string {
   <div class="container-narrow">
     <div class="share-cta">
       <div class="share-cta-text">
-        <strong>Shared from NexNote.</strong> Open notes like this in the iOS app to study, generate flashcards, and listen to AI podcasts.
+        <strong>Shared from NuNotes.</strong> Open notes like this in the iOS app to study, generate flashcards, and listen to AI podcasts.
       </div>
-      <a href="/#download" class="btn btn-primary">Get NexNote</a>
+      <a href="/#download" class="btn btn-primary">Get NuNotes</a>
     </div>
 
     <header class="share-header">
@@ -170,7 +172,7 @@ ${body}
     </article>
 
     <footer class="share-footer">
-      <div class="share-footer-note">© NexNote — Anyone with the link can view.</div>
+      <div class="share-footer-note">© NuNotes — Anyone with the link can view.</div>
       <a class="share-report-link" href="${reportHref}">Report this content</a>
     </footer>
   </div>
@@ -186,7 +188,7 @@ function renderShareNotFound(): string {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Link not available — NexNote</title>
+<title>Link not available — NuNotes</title>
 <meta name="robots" content="noindex">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -197,7 +199,7 @@ function renderShareNotFound(): string {
 
 <nav class="nav">
   <div class="container nav-inner">
-    <a href="/" class="nav-logo">NexNote</a>
+    <a href="/" class="nav-logo">NuNotes</a>
     <div class="nav-links">
       <a href="/#download" class="btn btn-primary">Get the app</a>
     </div>
@@ -208,7 +210,7 @@ function renderShareNotFound(): string {
   <div class="container-narrow share-error">
     <h1>This link isn't available.</h1>
     <p>The share link may have been revoked, expired, or never existed.</p>
-    <a href="/" class="btn btn-primary btn-lg">Back to NexNote</a>
+    <a href="/" class="btn btn-primary btn-lg">Back to NuNotes</a>
   </div>
 </main>
 

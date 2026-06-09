@@ -1,12 +1,12 @@
 import { supabase, geminiKey } from "./clients.js";
 import { SYSTEM_PROMPT, buildUserPrompt } from "./prompt.js";
-// ~200k tokens; well under Gemini 2.5 Flash's 1M context.
+// ~200k tokens; well under Gemini 3.1 Flash Lite's context window.
 const MAX_TRANSCRIPT_CHARS = 800_000;
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-3.1-flash-lite";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
-// Public pricing for Gemini 2.5 Flash (USD per 1M tokens). Update if Google changes pricing.
-const INPUT_PRICE_PER_1M = 0.30;
-const OUTPUT_PRICE_PER_1M = 2.50;
+// Public pricing for Gemini 3.1 Flash Lite (USD per 1M tokens). Update if Google changes pricing.
+const INPUT_PRICE_PER_1M = 0.25;
+const OUTPUT_PRICE_PER_1M = 0.50;
 const TITLE_MAX_CHARS = 40;
 export async function runSummaryJob(args) {
     const { jobId, noteId, bucket, path } = args;
@@ -172,7 +172,7 @@ async function generateSummary(systemPrompt, userPrompt) {
             // English) where Gemini occasionally over-produces despite the
             // prompt's length cap. The prompt itself is the primary throttle —
             // see `prompt.ts` for the per-call markdown character target.
-            // Cap is well below Gemini 2.5 Flash's 65 536 limit; raising it
+            // Cap is well below the model's max output limit; raising it
             // higher tempted the model to ramble and corrupt the structured
             // JSON output (whitespace walls, stray ```json fences inside the
             // markdown string).

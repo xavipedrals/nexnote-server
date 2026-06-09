@@ -10,15 +10,20 @@
 // into a checked-in HTML file.
 //
 // Required env vars (Cloudflare Pages → Settings → Environment):
-//   - SUPABASE_URL  e.g. https://<project>.supabase.co
+//   - SUPABASE_URL       e.g. https://<project>.supabase.co
+//   - SUPABASE_ANON_KEY  publishable key — sent as `apikey` on the POST to
+//                        `submit-report` (same as `/s/<token>` uses for reads)
 //
 // Query params:
 //   ?token=<share-token>  — when present, pre-associates the report with
 //                           the share link the reporter clicked through.
+//   ?noteId=<uuid>        — fallback target note when no token (e.g. opened
+//                           from the iOS app) or when the token lookup fails.
 // ---------------------------------------------------------------------------
 
 interface Env {
   SUPABASE_URL: string;
+  SUPABASE_ANON_KEY: string;
 }
 
 const NO_STORE: HeadersInit = {
@@ -30,10 +35,14 @@ const NO_STORE: HeadersInit = {
 export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
+  const noteId = url.searchParams.get("noteId");
   const submitUrl = env.SUPABASE_URL
     ? `${env.SUPABASE_URL.replace(/\/$/, "")}/functions/v1/submit-report`
     : "";
-  return new Response(renderReportPage(token, submitUrl), { headers: NO_STORE });
+  return new Response(
+    renderReportPage(token, noteId, submitUrl, env.SUPABASE_ANON_KEY ?? ""),
+    { headers: NO_STORE },
+  );
 };
 
 function escapeHtml(s: string): string {
@@ -45,17 +54,24 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function renderReportPage(token: string | null, submitUrl: string): string {
+function renderReportPage(
+  token: string | null,
+  noteId: string | null,
+  submitUrl: string,
+  apiKey: string,
+): string {
   const safeToken = token ? escapeHtml(token) : "";
+  const safeNoteId = noteId ? escapeHtml(noteId) : "";
   const safeSubmitUrl = escapeHtml(submitUrl);
+  const safeApiKey = escapeHtml(apiKey);
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Report content — NexNote</title>
-<meta name="description" content="Report content shared on NexNote that you believe violates copyright, our terms, or applicable law.">
+<title>Report content — NuNotes</title>
+<meta name="description" content="Report content shared on NuNotes that you believe violates copyright, our terms, or applicable law.">
 <meta name="robots" content="noindex">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -66,7 +82,7 @@ function renderReportPage(token: string | null, submitUrl: string): string {
 
 <nav class="nav">
   <div class="container nav-inner">
-    <a href="/" class="nav-logo">NexNote</a>
+    <a href="/" class="nav-logo">NuNotes</a>
     <div class="nav-links">
       <a href="/#download" class="btn btn-primary">Get the app</a>
     </div>
@@ -82,7 +98,7 @@ function renderReportPage(token: string | null, submitUrl: string): string {
       Thanks — your report has been submitted. We'll review it and follow up if we need more information.
     </div>
 
-    <form id="report-form" class="report-form" data-endpoint="${safeSubmitUrl}" data-token="${safeToken}" novalidate>
+    <form id="report-form" class="report-form" data-endpoint="${safeSubmitUrl}" data-apikey="${safeApiKey}" data-token="${safeToken}" data-note-id="${safeNoteId}" novalidate>
       <div>
         <label class="report-field-label">Why are you reporting this content?</label>
         <div class="report-radio-group">
@@ -144,14 +160,20 @@ function renderReportPage(token: string | null, submitUrl: string): string {
     submit.textContent = 'Submitting…';
     var payload = {
       token: form.dataset.token || undefined,
+      noteId: form.dataset.noteId || undefined,
       reason: reason,
       description: fd.get('description') || undefined,
       reporterName: fd.get('reporterName') || undefined,
       reporterEmail: fd.get('reporterEmail') || undefined,
     };
+    var headers = { 'Content-Type': 'application/json' };
+    if (form.dataset.apikey) {
+      headers.apikey = form.dataset.apikey;
+      headers.Authorization = 'Bearer ' + form.dataset.apikey;
+    }
     fetch(form.dataset.endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers,
       body: JSON.stringify(payload),
     })
       .then(function (resp) { return resp.json().then(function (j) { return { ok: resp.ok, body: j }; }); })

@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { sendFlashcardReadyPushIfNeeded } from "../_shared/apns.ts";
 import { checkDailyJobLimit } from "../_shared/premium.ts";
 import { generateBatch } from "./gemini.ts";
 import { normalizeFront } from "./dedup.ts";
@@ -102,7 +103,7 @@ Deno.serve(async (req) => {
     // --- Note + ownership ----------------------------------------------------
     const { data: note, error: noteErr } = await admin
         .from("notes")
-        .select("user_id, raw_transcript, display_language_code")
+        .select("user_id, raw_transcript, display_language_code, title")
         .eq("id", noteId)
         .maybeSingle();
     if (noteErr) return json({ error: "note_lookup_failed" }, 500);
@@ -281,17 +282,24 @@ Deno.serve(async (req) => {
     // stuck forever). Retry a few times, then mark failed so stale-lock
     // + retry can recover.
     let finalErr: { message: string } | null = null;
+    let notifyWhenReady = false;
     for (let attempt = 0; attempt < 5; attempt++) {
-        const { error: err } = await admin
+        const { data: finalized, error: err } = await admin
             .from("flashcard_decks")
             .update({
                 status: "ready",
                 generation_started_at: null,
                 generation_error: null,
             })
-            .eq("id", deckId);
+            .eq("id", deckId)
+            .select("notify_when_ready")
+            .single();
         if (!err) {
             finalErr = null;
+            notifyWhenReady = Boolean(
+                (finalized as { notify_when_ready?: boolean } | null)
+                    ?.notify_when_ready,
+            );
             break;
         }
         finalErr = err;
@@ -305,6 +313,13 @@ Deno.serve(async (req) => {
         );
         return json({ error: "finalize_failed" }, 500);
     }
+
+    await sendFlashcardReadyPushIfNeeded(admin, {
+        userId,
+        deckId,
+        noteTitle: (note.title ?? "").trim() || "Your note",
+        notifyWhenReady,
+    }).catch((e) => console.warn("apns: sendFlashcardReadyPushIfNeeded:", e));
 
     return json({
         deck_id: deckId,

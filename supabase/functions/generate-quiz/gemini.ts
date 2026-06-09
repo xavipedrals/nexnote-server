@@ -7,7 +7,7 @@
 // with the schema (`quiz_questions.correct_option text`) without any post-LLM
 // remapping.
 
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-3.1-flash-lite";
 const ENDPOINT =
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 

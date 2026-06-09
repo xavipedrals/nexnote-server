@@ -48,6 +48,26 @@ interface RequestBody {
     jobId?: string;
 }
 
+interface LiveJob {
+    id: string;
+    status: string;
+    started_at: string | null;
+}
+
+/// Healthy summarize calls finish in well under a minute. If a job has been
+/// `processing` longer than this without completing, the worker probably
+/// crashed or the kick never landed — re-kick on dedup / explicit retry.
+const STALE_PROCESSING_MS = 3 * 60 * 1000;
+
+function shouldRekickWorker(job: LiveJob): boolean {
+    if (job.status === "queued") return true;
+    if (job.status === "processing") {
+        if (!job.started_at) return true;
+        return Date.now() - new Date(job.started_at).getTime() > STALE_PROCESSING_MS;
+    }
+    return false;
+}
+
 Deno.serve(async (req) => {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
     if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
@@ -79,6 +99,54 @@ Deno.serve(async (req) => {
         auth: { persistSession: false },
     });
 
+    const noteId = body.noteId;
+
+    // Explicit retry from iOS: reset the named job and always re-kick the
+    // worker. Skip dedup — otherwise a dead `queued` row from an earlier
+    // attempt can be returned without ever enqueueing Cloud Run again.
+    if (body.jobId) {
+        const jobId = body.jobId;
+        const { data: job, error: upsertErr } = await admin
+            .from("summary_jobs")
+            .upsert(
+                {
+                    id: jobId,
+                    user_id: userId,
+                    note_id: noteId,
+                    bucket: body.bucket,
+                    path: body.path,
+                    status: "queued",
+                    error: null,
+                    markdown: null,
+                    started_at: null,
+                    completed_at: null,
+                },
+                { onConflict: "id" },
+            )
+            .select()
+            .single();
+        if (upsertErr || !job) {
+            console.error("summarize-transcript: retry upsert failed", {
+                message: upsertErr?.message,
+                noteId,
+                jobId,
+                userId,
+            });
+            return json({ error: `Failed to reset job: ${upsertErr?.message}` }, 500);
+        }
+
+        await admin
+            .from("summary_jobs")
+            .update({ retry_count: (job.retry_count ?? 0) + 1 })
+            .eq("id", jobId);
+
+        console.log(
+            `summarize-transcript: explicit retry, resetting job ${jobId} for note ${noteId}`,
+        );
+        kickWorker(admin, { jobId, noteId, bucket: body.bucket, path: body.path });
+        return json({ jobId, status: "queued", retried: true }, 202);
+    }
+
     // Dedup: if there's already a fresh queued / processing job for this
     // note, reuse it instead of kicking a second worker. Without this guard,
     // a user double-tapping Retry — or just retrying while a previous worker
@@ -97,8 +165,8 @@ Deno.serve(async (req) => {
     const cutoff = new Date(Date.now() - FRESHNESS_WINDOW_MS).toISOString();
     const { data: liveJobs, error: liveErr } = await admin
         .from("summary_jobs")
-        .select("id, status, created_at")
-        .eq("note_id", body.noteId)
+        .select("id, status, started_at")
+        .eq("note_id", noteId)
         .eq("user_id", userId)
         .in("status", ["queued", "processing"])
         .gte("created_at", cutoff)
@@ -110,16 +178,28 @@ Deno.serve(async (req) => {
             code: liveErr.code,
             details: liveErr.details,
             hint: liveErr.hint,
-            noteId: body.noteId,
+            noteId,
             userId,
         });
         return json({ error: `Dedup check failed: ${liveErr.message}` }, 500);
     }
     if (liveJobs && liveJobs.length > 0) {
-        const existing = liveJobs[0];
-        console.log(
-            `summarize-transcript: dedup hit, reusing job ${existing.id} for note ${body.noteId}`,
-        );
+        const existing = liveJobs[0] as LiveJob;
+        if (shouldRekickWorker(existing)) {
+            console.log(
+                `summarize-transcript: dedup hit, re-kicking stale job ${existing.id} for note ${noteId}`,
+            );
+            kickWorker(admin, {
+                jobId: existing.id,
+                noteId,
+                bucket: body.bucket,
+                path: body.path,
+            });
+        } else {
+            console.log(
+                `summarize-transcript: dedup hit, reusing in-flight job ${existing.id} for note ${noteId}`,
+            );
+        }
         return json({ jobId: existing.id, status: existing.status, deduped: true }, 202);
     }
 
@@ -128,20 +208,20 @@ Deno.serve(async (req) => {
         return json(summaryRate.body, summaryRate.status);
     }
 
-    const jobId = body.jobId ?? crypto.randomUUID();
+    const jobId = crypto.randomUUID();
     const { data: job, error: upsertErr } = await admin
         .from("summary_jobs")
         .upsert(
             {
                 id: jobId,
                 user_id: userId,
-                note_id: body.noteId,
+                note_id: noteId,
                 bucket: body.bucket,
                 path: body.path,
                 status: "queued",
                 error: null,
                 markdown: null,
-                retry_count: body.jobId ? undefined : 0,
+                retry_count: 0,
                 started_at: null,
                 completed_at: null,
             },
@@ -155,7 +235,7 @@ Deno.serve(async (req) => {
             code: upsertErr?.code,
             details: upsertErr?.details,
             hint: upsertErr?.hint,
-            noteId: body.noteId,
+            noteId,
             jobId,
             userId,
             bucket: body.bucket,
@@ -165,31 +245,27 @@ Deno.serve(async (req) => {
         return json({ error: `Failed to create job: ${upsertErr?.message}` }, 500);
     }
 
-    if (body.jobId) {
-        await admin
-            .from("summary_jobs")
-            .update({ retry_count: (job.retry_count ?? 0) + 1 })
-            .eq("id", jobId);
-    } else {
-        await admin.from("ai_jobs").insert({
-            user_id: userId,
-            kind: "summarize_transcript",
-        });
-    }
+    await admin.from("ai_jobs").insert({
+        user_id: userId,
+        kind: "summarize_transcript",
+    });
 
-    const noteId = body.noteId;
+    kickWorker(admin, { jobId, noteId, bucket: body.bucket, path: body.path });
+    return json({ jobId, status: "queued" }, 202);
+});
+
+function kickWorker(
+    admin: ReturnType<typeof createClient>,
+    args: { jobId: string; noteId: string; bucket: string; path: string },
+) {
+    const { jobId, noteId, bucket, path } = args;
     const kick = fetch(`${WORKER_URL}/summarize`, {
         method: "POST",
         headers: {
             "Authorization": `Bearer ${WORKER_SHARED_SECRET}`,
             "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-            jobId,
-            noteId,
-            bucket: body.bucket,
-            path: body.path,
-        }),
+        body: JSON.stringify({ jobId, noteId, bucket, path }),
     }).catch(async (e) => {
         console.error("kick worker failed", e);
         await admin
@@ -208,9 +284,7 @@ Deno.serve(async (req) => {
 
     // @ts-ignore EdgeRuntime is provided by Supabase
     EdgeRuntime.waitUntil(kick);
-
-    return json({ jobId, status: "queued" }, 202);
-});
+}
 
 function json(payload: unknown, status = 200) {
     return new Response(JSON.stringify(payload), {

@@ -2,7 +2,7 @@
 // already in `existingFronts` (normalized). Returns [] when the model signals
 // saturation — the caller uses that as a stop signal.
 
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-3.1-flash-lite";
 const ENDPOINT =
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 

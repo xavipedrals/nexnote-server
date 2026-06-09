@@ -15,6 +15,7 @@ def load(name: str) -> str:
 index_html = escape_template(load("index.html"))
 privacy_html = escape_template(load("privacy.html"))
 terms_html = escape_template(load("terms.html"))
+support_html = escape_template(load("support.html"))
 styles_css = escape_template(load("styles.css"))
 
 ts = f"""import \"jsr:@supabase/functions-js/edge-runtime.d.ts\";
@@ -22,6 +23,7 @@ ts = f"""import \"jsr:@supabase/functions-js/edge-runtime.d.ts\";
 const INDEX_HTML = `{index_html}`;
 const PRIVACY_HTML = `{privacy_html}`;
 const TERMS_HTML = `{terms_html}`;
+const SUPPORT_HTML = `{support_html}`;
 const STYLES_CSS = `{styles_css}`;
 
 const HTML_HEADERS = {{
@@ -59,6 +61,9 @@ Deno.serve((req: Request) => {{
     case \"/terms\":
     case \"/terms.html\":
       return new Response(TERMS_HTML, {{ headers: HTML_HEADERS }});
+    case \"/support\":
+    case \"/support.html\":
+      return new Response(SUPPORT_HTML, {{ headers: HTML_HEADERS }});
     case \"/styles.css\":
       return new Response(STYLES_CSS, {{ headers: CSS_HEADERS }});
     default:

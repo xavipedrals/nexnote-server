@@ -56,6 +56,8 @@ const VALID_REASONS = new Set([
 const MAX_DESCRIPTION = 4000;
 const MAX_EMAIL = 254;
 const MAX_NAME = 200;
+const UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface RequestBody {
     token?: string;
@@ -90,44 +92,20 @@ serve(async (req) => {
     if (!token && !explicitNoteId) {
         return cors(jsonError(400, "Either token or noteId is required"));
     }
+    if (explicitNoteId && !isValidUuid(explicitNoteId)) {
+        return cors(jsonError(400, "Note ID is not valid"));
+    }
 
     const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
         auth: { persistSession: false },
     });
 
-    // Resolve the report's target note via the share token. We never trust a
-    // raw noteId from an anonymous body alone — without a token, we'd be
-    // letting anyone enqueue reports against arbitrary notes. Permit the
-    // explicit-noteId path only when no token was provided AND the note
-    // actually exists; this lets us swap in iOS-app-side reports later
-    // without re-shaping the API.
     let noteId: string;
-    if (token) {
-        const { data: link, error: linkErr } = await admin
-            .from("note_share_links")
-            .select("note_id")
-            .eq("token", token)
-            .maybeSingle();
-        if (linkErr) {
-            return cors(jsonError(500, `Couldn't look up share link: ${linkErr.message}`));
-        }
-        if (!link) {
-            return cors(jsonError(404, "Share link not found"));
-        }
-        noteId = link.note_id;
-    } else {
-        const { data: note, error: noteErr } = await admin
-            .from("notes")
-            .select("id")
-            .eq("id", explicitNoteId!)
-            .maybeSingle();
-        if (noteErr) {
-            return cors(jsonError(500, `Couldn't look up note: ${noteErr.message}`));
-        }
-        if (!note) {
-            return cors(jsonError(404, "Note not found"));
-        }
-        noteId = note.id;
+    try {
+        noteId = await resolveReportNoteId(admin, token, explicitNoteId);
+    } catch (e) {
+        const err = e as ReportResolveError;
+        return cors(jsonError(err.status, err.message));
     }
 
     const userAgent = req.headers.get("User-Agent")?.slice(0, 500) ?? null;
@@ -147,7 +125,8 @@ serve(async (req) => {
         .single();
 
     if (insertErr) {
-        return cors(jsonError(500, `Couldn't save report: ${insertErr.message}`));
+        console.error("[submit-report] insert failed:", insertErr.message);
+        return cors(jsonError(500, "Couldn't save report"));
     }
 
     // Fire-and-forget email notification. Failure here mustn't fail the
@@ -205,7 +184,7 @@ async function sendNotificationEmail(p: EmailParams): Promise<void> {
             from: REPORT_FROM_EMAIL,
             to: [REPORT_NOTIFY_EMAIL],
             reply_to: p.reporterEmail ?? undefined,
-            subject: `[NexNote report] ${p.reason} — note ${p.noteId.slice(0, 8)}`,
+            subject: `[NuNotes report] ${p.reason} — note ${p.noteId.slice(0, 8)}`,
             html: lines,
         }),
     });
@@ -219,6 +198,67 @@ async function sendNotificationEmail(p: EmailParams): Promise<void> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+class ReportResolveError extends Error {
+    constructor(readonly status: number, message: string) {
+        super(message);
+    }
+}
+
+async function resolveReportNoteId(
+    admin: ReturnType<typeof createClient>,
+    token: string | null,
+    explicitNoteId: string | null,
+): Promise<string> {
+    if (token) {
+        const { data: link, error: linkErr } = await admin
+            .from("note_share_links")
+            .select("note_id")
+            .eq("token", token)
+            .maybeSingle();
+        if (linkErr) {
+            console.error("[submit-report] share link lookup failed:", linkErr.message);
+            throw new ReportResolveError(500, "Couldn't look up share link");
+        }
+        if (link) {
+            const resolved = await fetchExistingNoteId(admin, link.note_id as string);
+            if (resolved) return resolved;
+            throw new ReportResolveError(404, "Note not found");
+        }
+        // Token missing from DB — fall back to an explicit note id when the
+        // share page also embedded it (stale bookmark, rotated link, etc.).
+        if (explicitNoteId) {
+            const resolved = await fetchExistingNoteId(admin, explicitNoteId);
+            if (resolved) return resolved;
+            throw new ReportResolveError(404, "Note not found");
+        }
+        throw new ReportResolveError(404, "Share link not found");
+    }
+
+    const resolved = await fetchExistingNoteId(admin, explicitNoteId!);
+    if (resolved) return resolved;
+    throw new ReportResolveError(404, "Note not found");
+}
+
+async function fetchExistingNoteId(
+    admin: ReturnType<typeof createClient>,
+    noteId: string,
+): Promise<string | null> {
+    const { data: note, error: noteErr } = await admin
+        .from("notes")
+        .select("id")
+        .eq("id", noteId)
+        .maybeSingle();
+    if (noteErr) {
+        console.error("[submit-report] note lookup failed:", noteErr.message);
+        throw new ReportResolveError(500, "Couldn't look up note");
+    }
+    return note ? (note.id as string) : null;
+}
+
+function isValidUuid(value: string): boolean {
+    return UUID_RE.test(value);
+}
 
 function trimOrNull(v: string | undefined, max: number): string | null {
     if (typeof v !== "string") return null;

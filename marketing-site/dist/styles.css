@@ -95,14 +95,23 @@ a:hover {
 }
 
 .nav-logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   font-size: 18px;
   font-weight: 700;
   color: var(--title);
   letter-spacing: -0.01em;
+  text-decoration: none;
 }
 
 .nav-logo:hover {
   color: var(--title);
+}
+
+.nav-logo-icon {
+  border-radius: 8px;
+  flex-shrink: 0;
 }
 
 .nav-links {
@@ -169,6 +178,7 @@ a:hover {
 .hero {
   padding: 96px 0 64px;
   text-align: center;
+  background: linear-gradient(180deg, #ecfdf5 0%, var(--bg) 70%);
 }
 
 .hero h1 {
@@ -202,11 +212,90 @@ a:hover {
 /* Hero mockup */
 .hero-mockup {
   margin: 48px auto 0;
-  max-width: 760px;
-  aspect-ratio: 16 / 10;
-  background: var(--bg-alt);
+  max-width: 280px;
+}
+
+.hero-mockup img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 28px;
+  box-shadow:
+    0 4px 6px rgba(15, 23, 42, 0.04),
+    0 24px 48px rgba(15, 23, 42, 0.12);
   border: 1px solid var(--border);
+}
+
+/* Feature bands */
+.feature-band {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 64px;
+  align-items: center;
+  margin-bottom: 80px;
+}
+
+.feature-band:last-child {
+  margin-bottom: 0;
+}
+
+.feature-band-reverse .feature-band-media {
+  order: 2;
+}
+
+.feature-band-reverse .feature-band-copy {
+  order: 1;
+}
+
+.feature-band-media {
+  display: flex;
+  justify-content: center;
+}
+
+.feature-band-media img {
+  width: 100%;
+  max-width: 260px;
+  height: auto;
+  border-radius: 28px;
+  box-shadow:
+    0 4px 6px rgba(15, 23, 42, 0.04),
+    0 20px 40px rgba(15, 23, 42, 0.1);
+  border: 1px solid var(--border);
+}
+
+.feature-band-copy h2 {
+  font-size: 32px;
+  margin-bottom: 16px;
+  letter-spacing: -0.02em;
+}
+
+.feature-band-copy p {
+  font-size: 17px;
+  line-height: 1.65;
+}
+
+/* ASO screenshot gallery */
+.screenshot-gallery-section .section-header {
+  margin-bottom: 32px;
+}
+
+.screenshot-gallery {
+  display: flex;
+  gap: 20px;
+  overflow-x: auto;
+  padding: 8px 4px 24px;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+
+.screenshot-gallery img {
+  flex: 0 0 auto;
+  height: 420px;
+  width: auto;
   border-radius: 16px;
+  scroll-snap-align: start;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
 }
 
 /* Sections */
@@ -283,11 +372,20 @@ a:hover {
 }
 
 .feature-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 40px;
   height: 40px;
   border-radius: 10px;
-  background: var(--bg-alt);
+  background: rgba(16, 185, 129, 0.1);
+  color: var(--accent);
   margin-bottom: 16px;
+}
+
+.feature-icon svg {
+  width: 22px;
+  height: 22px;
 }
 
 .feature h3 {
@@ -296,32 +394,6 @@ a:hover {
 
 .feature p {
   font-size: 15px;
-}
-
-/* Feature showcase */
-.showcase {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 64px;
-  align-items: center;
-}
-
-.showcase-media {
-  aspect-ratio: 4 / 5;
-  background: var(--bg-alt);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-}
-
-.showcase h2 {
-  font-size: 32px;
-  margin-bottom: 16px;
-  letter-spacing: -0.02em;
-}
-
-.showcase p {
-  font-size: 17px;
-  margin-bottom: 8px;
 }
 
 /* Testimonials */
@@ -442,9 +514,22 @@ a:hover {
 }
 
 .footer-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-size: 15px;
   font-weight: 600;
   color: var(--title);
+  text-decoration: none;
+}
+
+.footer-brand:hover {
+  color: var(--title);
+}
+
+.footer-logo-icon {
+  border-radius: 6px;
+  flex-shrink: 0;
 }
 
 .footer-links {
@@ -464,6 +549,24 @@ a:hover {
 .footer-copy {
   font-size: 13px;
   color: var(--text-muted);
+}
+
+.support-contact {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  margin-bottom: 40px;
+}
+
+.support-contact p {
+  margin: 0;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.support-contact a {
+  font-weight: 600;
 }
 
 /* Legal pages */
@@ -823,9 +926,24 @@ a:hover {
   .testimonials {
     grid-template-columns: 1fr;
   }
-  .showcase {
+  .feature-band,
+  .feature-band-reverse {
     grid-template-columns: 1fr;
     gap: 32px;
+    margin-bottom: 56px;
+  }
+
+  .feature-band-reverse .feature-band-media,
+  .feature-band-reverse .feature-band-copy {
+    order: unset;
+  }
+
+  .feature-band-copy h2 {
+    font-size: 26px;
+  }
+
+  .screenshot-gallery img {
+    height: 360px;
   }
   .final-cta {
     padding: 64px 20px;

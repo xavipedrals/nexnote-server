@@ -392,6 +392,42 @@ $$;
 ALTER FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."count_reviews_today_in_folder"("p_folder_id" "uuid", "p_since" timestamp with time zone) RETURNS integer
+    LANGUAGE "sql" STABLE
+    AS $$
+    select count(*)::int
+    from flashcard_reviews r
+    join flashcards c on c.id = r.flashcard_id
+    join flashcard_decks d on d.id = c.deck_id
+    join notes n on n.id = d.note_id
+    where r.user_id = auth.uid()
+      and n.folder_id = p_folder_id
+      and r.reviewed_at >= p_since;
+$$;
+
+
+ALTER FUNCTION "public"."count_reviews_today_in_folder"("p_folder_id" "uuid", "p_since" timestamp with time zone) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."delete_current_user"() RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+    uid uuid := auth.uid();
+begin
+    if uid is null then
+        raise exception 'not authenticated';
+    end if;
+
+    delete from auth.users where id = uid;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."delete_current_user"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") RETURNS TABLE("flashcard_id" "uuid")
     LANGUAGE "sql" STABLE
     AS $$
@@ -406,6 +442,244 @@ $$;
 
 
 ALTER FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_combined_study_queue"("p_note_ids" "uuid"[], "p_limit" integer DEFAULT 20, "p_new_ratio" numeric DEFAULT 0.3, "p_allow_ahead" boolean DEFAULT false, "p_exclude_ids" "uuid"[] DEFAULT ARRAY[]::"uuid"[]) RETURNS TABLE("card_id" "uuid", "front" "text", "back" "text", "hint" "text", "bucket" "text", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer, "deck_id" "uuid", "note_id" "uuid", "note_title" "text", "desired_retention" double precision)
+    LANGUAGE "sql" STABLE
+    AS $$
+    with
+    card_pool as (
+        select
+            c.id,
+            c.front,
+            c.back,
+            c.hint,
+            d.id as deck_id,
+            n.id as note_id,
+            n.title as note_title,
+            d.desired_retention
+        from flashcards c
+        join flashcard_decks d on d.id = c.deck_id
+        join notes n on n.id = d.note_id
+        where d.note_id = any(p_note_ids)
+          and d.is_ai_generated = true
+          and can_access_note(n.id, p_require_study => true)
+    ),
+    excluded as (
+        select unnest(p_exclude_ids) as id
+    ),
+    not_excluded as (
+        select cp.*
+        from card_pool cp
+        where cardinality(p_exclude_ids) = 0
+           or not exists (select 1 from excluded e where e.id = cp.id)
+    ),
+
+    -- ── Standard mode (p_allow_ahead = false) ─────────────────────────────
+
+    new_quota as (
+        select greatest(0, least(p_limit, (p_limit::numeric * p_new_ratio)::int))::int as n
+    ),
+    due_pick as (
+        select
+            ne.id as card_id, ne.front, ne.back, ne.hint,
+            'due'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses,
+            ne.deck_id, ne.note_id, ne.note_title, ne.desired_retention
+        from not_excluded ne
+        join flashcard_progress p
+          on p.flashcard_id = ne.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is not null
+          and p.due_at <= now()
+        order by p.due_at asc
+        limit p_limit
+    ),
+    new_pick as (
+        select
+            ne.id as card_id, ne.front, ne.back, ne.hint,
+            'new'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses,
+            ne.deck_id, ne.note_id, ne.note_title, ne.desired_retention
+        from not_excluded ne
+        left join flashcard_progress p
+          on p.flashcard_id = ne.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is null
+        order by ne.id asc
+        limit (select n from new_quota)
+    ),
+    combined as (
+        select * from due_pick
+        union all
+        select * from new_pick
+    ),
+    new_extra_quota as (
+        select greatest(0, p_limit - (select count(*) from combined))::int as n
+    ),
+    new_extra as (
+        select
+            ne.id as card_id, ne.front, ne.back, ne.hint,
+            'new'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses,
+            ne.deck_id, ne.note_id, ne.note_title, ne.desired_retention
+        from not_excluded ne
+        left join flashcard_progress p
+          on p.flashcard_id = ne.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is null
+          and ne.id not in (select card_id from new_pick)
+        order by ne.id asc
+        limit (select n from new_extra_quota)
+    ),
+    combined_with_new as (
+        select * from combined
+        union all
+        select * from new_extra
+    ),
+    ahead_quota as (
+        select greatest(0, p_limit - (select count(*) from combined_with_new))::int as n
+    ),
+    ahead_pick_standard as (
+        select
+            ne.id as card_id, ne.front, ne.back, ne.hint,
+            'ahead'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses,
+            ne.deck_id, ne.note_id, ne.note_title, ne.desired_retention
+        from not_excluded ne
+        join flashcard_progress p
+          on p.flashcard_id = ne.id and p.user_id = auth.uid()
+        where p_allow_ahead
+          and not coalesce(p.is_suspended, false)
+          and p.state is not null
+          and not (p.due_at <= now())
+        order by p.due_at asc nulls last
+        limit (select n from ahead_quota)
+    ),
+    standard_final as (
+        select * from combined_with_new
+        union all
+        select * from ahead_pick_standard
+    ),
+
+    -- ── Study-ahead mode (p_allow_ahead = true) ───────────────────────────
+
+    scheduled_pick_ahead as (
+        select
+            ne.id as card_id, ne.front, ne.back, ne.hint,
+            case when p.due_at <= now() then 'due' else 'ahead' end::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses,
+            ne.deck_id, ne.note_id, ne.note_title, ne.desired_retention
+        from not_excluded ne
+        join flashcard_progress p
+          on p.flashcard_id = ne.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is not null
+        order by p.due_at asc nulls last
+        limit p_limit
+    ),
+    new_pick_ahead as (
+        select
+            ne.id as card_id, ne.front, ne.back, ne.hint,
+            'new'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses,
+            ne.deck_id, ne.note_id, ne.note_title, ne.desired_retention
+        from not_excluded ne
+        left join flashcard_progress p
+          on p.flashcard_id = ne.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is null
+        order by ne.id asc
+        limit p_limit
+    ),
+    ahead_mode_final as (
+        select * from scheduled_pick_ahead
+        union all
+        select * from new_pick_ahead
+    ),
+
+    final as (
+        select * from ahead_mode_final where p_allow_ahead
+        union all
+        select * from standard_final where not p_allow_ahead
+    )
+    select card_id, front, back, hint, bucket,
+           state, stability, difficulty,
+           due_at, last_reviewed_at, elapsed_days, scheduled_days,
+           step, reps, lapses,
+           deck_id, note_id, note_title, desired_retention
+    from final
+    order by
+        case bucket when 'due' then 0 when 'new' then 1 else 2 end,
+        due_at asc nulls last,
+        card_id;
+$$;
+
+
+ALTER FUNCTION "public"."get_combined_study_queue"("p_note_ids" "uuid"[], "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_deck_overview_stats"("p_deck_id" "uuid") RETURNS json
+    LANGUAGE "sql" STABLE
+    AS $$
+    select json_build_object(
+        'total_cards', (
+            select count(*)::int
+            from flashcards c
+            where c.deck_id = p_deck_id
+        ),
+        'session_count', (
+            select count(*)::int
+            from flashcard_study_sessions s
+            where s.deck_id = p_deck_id
+              and s.user_id = auth.uid()
+        ),
+        'total_study_secs', (
+            select coalesce(sum(s.duration_secs), 0)::int
+            from flashcard_study_sessions s
+            where s.deck_id = p_deck_id
+              and s.user_id = auth.uid()
+        ),
+        'rating_counts', coalesce((
+            select json_object_agg(rating_key, rating_cnt)
+            from (
+                select p.last_rating::text as rating_key, count(*)::int as rating_cnt
+                from flashcard_progress p
+                join flashcards c on c.id = p.flashcard_id
+                where c.deck_id = p_deck_id
+                  and p.user_id = auth.uid()
+                  and p.last_rating is not null
+                group by p.last_rating
+            ) ratings
+        ), '{}'::json),
+        'state_counts', coalesce((
+            select json_object_agg(state_key, state_cnt)
+            from (
+                select p.state::text as state_key, count(*)::int as state_cnt
+                from flashcard_progress p
+                join flashcards c on c.id = p.flashcard_id
+                where c.deck_id = p_deck_id
+                  and p.user_id = auth.uid()
+                group by p.state
+            ) states
+        ), '{}'::json)
+    );
+$$;
+
+
+ALTER FUNCTION "public"."get_deck_overview_stats"("p_deck_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_exam_card_states"("p_exam_id" "uuid") RETURNS TABLE("card_id" "uuid", "state" "public"."card_state", "stability" double precision, "difficulty" double precision, "due_at" timestamp with time zone, "last_reviewed_at" timestamp with time zone, "elapsed_days" integer, "scheduled_days" integer, "step" smallint, "reps" integer, "lapses" integer)
@@ -619,6 +893,56 @@ $$;
 ALTER FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_note_study_summaries"("p_note_ids" "uuid"[]) RETURNS TABLE("note_id" "uuid", "deck_id" "uuid", "total_cards" integer, "due_count" integer, "new_count" integer)
+    LANGUAGE "sql" STABLE
+    AS $$
+    with requested as (
+        select unnest(p_note_ids) as note_id
+    ),
+    ai_decks as (
+        select distinct on (d.note_id)
+            d.note_id,
+            d.id as deck_id
+        from flashcard_decks d
+        join requested r on r.note_id = d.note_id
+        where d.is_ai_generated = true
+        order by d.note_id, d.id asc
+    ),
+    card_stats as (
+        select
+            ad.note_id,
+            ad.deck_id,
+            count(c.id)::int as total_cards,
+            count(*) filter (
+                where p.state is not null
+                  and not coalesce(p.is_suspended, false)
+                  and p.due_at <= now()
+            )::int as due_count,
+            count(*) filter (
+                where p.state is null
+                  and not coalesce(p.is_suspended, false)
+            )::int as new_count
+        from ai_decks ad
+        left join flashcards c on c.deck_id = ad.deck_id
+        left join flashcard_progress p
+               on p.flashcard_id = c.id and p.user_id = auth.uid()
+        group by ad.note_id, ad.deck_id
+    )
+    select
+        r.note_id,
+        cs.deck_id,
+        coalesce(cs.total_cards, 0) as total_cards,
+        coalesce(cs.due_count, 0) as due_count,
+        coalesce(cs.new_count, 0) as new_count
+    from requested r
+    left join card_stats cs on cs.note_id = r.note_id
+    where can_access_note(r.note_id, p_require_study => true);
+$$;
+
+
+ALTER FUNCTION "public"."get_note_study_summaries"("p_note_ids" "uuid"[]) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_recent_again_rate"("p_window_days" integer DEFAULT 7, "p_min_reviews" integer DEFAULT 10) RETURNS double precision
     LANGUAGE "sql" STABLE
     AS $$
@@ -649,34 +973,17 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
     LANGUAGE "sql" STABLE
     AS $$
     with
-    excluded_ids as (
+    excluded as (
         select unnest(p_exclude_ids) as id
     ),
-    deck_cards as (
-        select c.id, c.front, c.back, c.hint
+    not_excluded as (
+        select c.id
         from flashcards c
         where c.deck_id = p_deck_id
-          and not exists (select 1 from excluded_ids e where e.id = c.id)
-    ),
-    enriched as (
-        select c.id as card_id, c.front, c.back, c.hint,
-               p.state, p.stability, p.difficulty,
-               p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
-               p.step, p.reps, p.lapses,
-               coalesce(p.is_suspended, false) as suspended
-        from deck_cards c
-        left join flashcard_progress p
-               on p.flashcard_id = c.id and p.user_id = auth.uid()
-    ),
-    classified as (
-        select *,
-               case
-                 when suspended            then 'suspended'
-                 when state is null        then 'new'
-                 when due_at <= now()      then 'due'
-                 else                            'ahead'
-               end as bucket
-        from enriched
+          and (
+              cardinality(p_exclude_ids) = 0
+              or not exists (select 1 from excluded e where e.id = c.id)
+          )
     ),
 
     -- ── Standard mode (p_allow_ahead = false) ─────────────────────────────
@@ -685,15 +992,36 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
         select greatest(0, least(p_limit, (p_limit::numeric * p_new_ratio)::int))::int as n
     ),
     due_pick as (
-        select * from classified
-        where bucket = 'due'
-        order by due_at asc
+        select
+            c.id as card_id, c.front, c.back, c.hint,
+            'due'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses
+        from flashcards c
+        join not_excluded ne on ne.id = c.id
+        join flashcard_progress p
+          on p.flashcard_id = c.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is not null
+          and p.due_at <= now()
+        order by p.due_at asc
         limit p_limit
     ),
     new_pick as (
-        select * from classified
-        where bucket = 'new'
-        order by random()
+        select
+            c.id as card_id, c.front, c.back, c.hint,
+            'new'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses
+        from flashcards c
+        join not_excluded ne on ne.id = c.id
+        left join flashcard_progress p
+          on p.flashcard_id = c.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is null
+        order by c.id asc
         limit (select n from new_quota)
     ),
     combined as (
@@ -705,10 +1033,20 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
         select greatest(0, p_limit - (select count(*) from combined))::int as n
     ),
     new_extra as (
-        select * from classified
-        where bucket = 'new'
-          and card_id not in (select card_id from new_pick)
-        order by random()
+        select
+            c.id as card_id, c.front, c.back, c.hint,
+            'new'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses
+        from flashcards c
+        join not_excluded ne on ne.id = c.id
+        left join flashcard_progress p
+          on p.flashcard_id = c.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is null
+          and c.id not in (select card_id from new_pick)
+        order by c.id asc
         limit (select n from new_extra_quota)
     ),
     combined_with_new as (
@@ -720,9 +1058,21 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
         select greatest(0, p_limit - (select count(*) from combined_with_new))::int as n
     ),
     ahead_pick_standard as (
-        select * from classified
-        where bucket = 'ahead' and p_allow_ahead
-        order by due_at asc
+        select
+            c.id as card_id, c.front, c.back, c.hint,
+            'ahead'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses
+        from flashcards c
+        join not_excluded ne on ne.id = c.id
+        join flashcard_progress p
+          on p.flashcard_id = c.id and p.user_id = auth.uid()
+        where p_allow_ahead
+          and not coalesce(p.is_suspended, false)
+          and p.state is not null
+          and not (p.due_at <= now())
+        order by p.due_at asc nulls last
         limit (select n from ahead_quota)
     ),
     standard_final as (
@@ -732,37 +1082,41 @@ CREATE OR REPLACE FUNCTION "public"."get_study_queue"("p_deck_id" "uuid", "p_lim
     ),
 
     -- ── Study-ahead mode (p_allow_ahead = true) ───────────────────────────
-    -- Up to p_limit due (if any remain), plus p_limit ahead (closest future
-    -- due) and p_limit new — independent quotas, not sharing one cap.
 
-    due_pick_ahead as (
-        select * from classified
-        where bucket = 'due'
-        order by due_at asc
+    scheduled_pick_ahead as (
+        select
+            c.id as card_id, c.front, c.back, c.hint,
+            case when p.due_at <= now() then 'due' else 'ahead' end::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses
+        from flashcards c
+        join not_excluded ne on ne.id = c.id
+        join flashcard_progress p
+          on p.flashcard_id = c.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is not null
+        order by p.due_at asc nulls last
         limit p_limit
-    ),
-    ahead_pick_ahead as (
-        select * from classified
-        where bucket = 'ahead'
-        order by due_at asc
-        limit p_limit
-    ),
-    picked_before_new_ahead as (
-        select card_id from due_pick_ahead
-        union
-        select card_id from ahead_pick_ahead
     ),
     new_pick_ahead as (
-        select * from classified
-        where bucket = 'new'
-          and card_id not in (select card_id from picked_before_new_ahead)
-        order by random()
+        select
+            c.id as card_id, c.front, c.back, c.hint,
+            'new'::text as bucket,
+            p.state, p.stability, p.difficulty,
+            p.due_at, p.last_reviewed_at, p.elapsed_days, p.scheduled_days,
+            p.step, p.reps, p.lapses
+        from flashcards c
+        join not_excluded ne on ne.id = c.id
+        left join flashcard_progress p
+          on p.flashcard_id = c.id and p.user_id = auth.uid()
+        where not coalesce(p.is_suspended, false)
+          and p.state is null
+        order by c.id asc
         limit p_limit
     ),
     ahead_mode_final as (
-        select * from due_pick_ahead
-        union all
-        select * from ahead_pick_ahead
+        select * from scheduled_pick_ahead
         union all
         select * from new_pick_ahead
     ),
@@ -1129,6 +1483,60 @@ $$;
 
 
 ALTER FUNCTION "public"."set_updated_at"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."test_get_combined_study_queue_quota_math"("p_note_ids" "uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+declare
+    v_limit int := 20;
+    v_count int;
+begin
+    select count(*) into v_count
+    from get_combined_study_queue(p_note_ids, v_limit, 0.3, false, array[]::uuid[]);
+    if v_count > v_limit then
+        raise exception 'standard combined queue returned % rows, limit %', v_count, v_limit;
+    end if;
+
+    select count(*) into v_count
+    from get_combined_study_queue(p_note_ids, v_limit, 0.3, true, array[]::uuid[]);
+    if v_count > v_limit * 2 then
+        raise exception 'ahead combined queue returned % rows, max expected %', v_count, v_limit * 2;
+    end if;
+
+    raise notice 'get_combined_study_queue quota checks passed for % notes', cardinality(p_note_ids);
+end;
+$$;
+
+
+ALTER FUNCTION "public"."test_get_combined_study_queue_quota_math"("p_note_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."test_get_study_queue_quota_math"("p_deck_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+declare
+    v_limit int := 20;
+    v_count int;
+begin
+    select count(*) into v_count
+    from get_study_queue(p_deck_id, v_limit, 0.3, false, array[]::uuid[]);
+    if v_count > v_limit then
+        raise exception 'standard queue returned % rows, limit %', v_count, v_limit;
+    end if;
+
+    select count(*) into v_count
+    from get_study_queue(p_deck_id, v_limit, 0.3, true, array[]::uuid[]);
+    if v_count > v_limit * 2 then
+        raise exception 'ahead queue returned % rows, max expected %', v_count, v_limit * 2;
+    end if;
+
+    raise notice 'get_study_queue quota checks passed for deck %', p_deck_id;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."test_get_study_queue_quota_math"("p_deck_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."touch_note_last_studied"("p_note_id" "uuid") RETURNS "void"
@@ -2121,6 +2529,10 @@ CREATE INDEX "note_sources_note_id_sort_order_idx" ON "public"."note_sources" US
 
 
 
+CREATE INDEX "notes_folder_id_idx" ON "public"."notes" USING "btree" ("folder_id");
+
+
+
 CREATE INDEX "notes_title_trgm_idx" ON "public"."notes" USING "gin" ("title" "public"."gin_trgm_ops");
 
 
@@ -2137,6 +2549,10 @@ CREATE INDEX "notes_user_id_last_studied_at_idx" ON "public"."notes" USING "btre
 
 
 
+CREATE INDEX "notes_user_processing_idx" ON "public"."notes" USING "btree" ("user_id") WHERE ("summary_status" = 'processing'::"public"."note_status");
+
+
+
 CREATE INDEX "onboarding_dropoffs_created_at_idx" ON "public"."onboarding_dropoffs" USING "btree" ("created_at" DESC);
 
 
@@ -2150,6 +2566,10 @@ CREATE INDEX "onboarding_dropoffs_install_id_idx" ON "public"."onboarding_dropof
 
 
 CREATE UNIQUE INDEX "onboarding_dropoffs_session_id_key" ON "public"."onboarding_dropoffs" USING "btree" ("session_id");
+
+
+
+CREATE INDEX "podcasts_note_created_active_idx" ON "public"."podcasts" USING "btree" ("note_id", "created_at" DESC) WHERE ("status" <> 'deleted'::"public"."podcast_status");
 
 
 
@@ -2182,6 +2602,10 @@ CREATE INDEX "quiz_question_reports_user_idx" ON "public"."quiz_question_reports
 
 
 CREATE INDEX "quiz_questions_quiz_id_position_idx" ON "public"."quiz_questions" USING "btree" ("quiz_id", "position");
+
+
+
+CREATE INDEX "quizzes_note_created_idx" ON "public"."quizzes" USING "btree" ("note_id", "created_at" DESC);
 
 
 
@@ -3020,9 +3444,33 @@ GRANT ALL ON FUNCTION "public"."clone_shared_note_from_link"("p_token" "text") T
 
 
 
+GRANT ALL ON FUNCTION "public"."count_reviews_today_in_folder"("p_folder_id" "uuid", "p_since" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."count_reviews_today_in_folder"("p_folder_id" "uuid", "p_since" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."count_reviews_today_in_folder"("p_folder_id" "uuid", "p_since" timestamp with time zone) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."delete_current_user"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."delete_current_user"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_current_user"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."exam_card_set"("p_exam_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_combined_study_queue"("p_note_ids" "uuid"[], "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_combined_study_queue"("p_note_ids" "uuid"[], "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_combined_study_queue"("p_note_ids" "uuid"[], "p_limit" integer, "p_new_ratio" numeric, "p_allow_ahead" boolean, "p_exclude_ids" "uuid"[]) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_deck_overview_stats"("p_deck_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_deck_overview_stats"("p_deck_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_deck_overview_stats"("p_deck_id" "uuid") TO "service_role";
 
 
 
@@ -3041,6 +3489,12 @@ GRANT ALL ON FUNCTION "public"."get_exam_engine_cards"("p_exam_id" "uuid") TO "s
 GRANT ALL ON FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_exam_study_queue"("p_exam_id" "uuid", "p_limit" integer, "p_period" "public"."exam_period", "p_new_count" integer, "p_exclude_ids" "uuid"[]) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_note_study_summaries"("p_note_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_note_study_summaries"("p_note_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_note_study_summaries"("p_note_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -3101,6 +3555,18 @@ GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."test_get_combined_study_queue_quota_math"("p_note_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."test_get_combined_study_queue_quota_math"("p_note_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."test_get_combined_study_queue_quota_math"("p_note_ids" "uuid"[]) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."test_get_study_queue_quota_math"("p_deck_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."test_get_study_queue_quota_math"("p_deck_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."test_get_study_queue_quota_math"("p_deck_id" "uuid") TO "service_role";
 
 
 

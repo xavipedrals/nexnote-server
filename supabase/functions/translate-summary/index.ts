@@ -30,7 +30,7 @@ const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY")!;
 
 // Best cost-to-quality model for translation. 2.5 Flash handles long markdown
 // with good fidelity at ~$0.30 / 1M input tokens.
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 interface RequestBody {
     noteId: string;

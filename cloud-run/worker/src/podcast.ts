@@ -20,7 +20,7 @@ interface ScriptLine {
     text: string;
 }
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 // Progress checkpoints (0–100). TTS dominates wall-clock time so it gets
 // the largest share. iOS reads `progress_percent` over Realtime and renders
