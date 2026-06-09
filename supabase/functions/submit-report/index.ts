@@ -9,18 +9,22 @@
 //   against arbitrary note ids submitted by hand).
 // - Inserts into `public.note_reports` with the service role key (the table
 //   has no insert policy, so only the service role can write).
-// - If `RESEND_API_KEY` is configured, fires a notification email to
-//   bestindieapps@gmail.com so reports surface promptly. Failure to send the
-//   email does NOT fail the request — the DB row is the source of truth.
+// - If `REPORT_SMTP_PASSWORD` is configured, fires a notification email to
+//   bestindieapps@gmail.com via Private Email SMTP so reports surface promptly.
+//   Failure to send the email does NOT fail the request — the DB row is the
+//   source of truth.
 //
 // Required env vars:
 //   - SUPABASE_URL
 //   - SUPABASE_SERVICE_ROLE_KEY
 //
 // Optional env vars (email notification):
-//   - RESEND_API_KEY      — send via https://resend.com
-//   - REPORT_NOTIFY_EMAIL — override recipient (default: bestindieapps@gmail.com)
-//   - REPORT_FROM_EMAIL   — From address (default: reports@nexnote.app)
+//   - REPORT_SMTP_PASSWORD — mailbox password (required to send)
+//   - REPORT_SMTP_HOST     — default: mail.privateemail.com
+//   - REPORT_SMTP_PORT     — default: 465 (use 587 for STARTTLS)
+//   - REPORT_SMTP_USER     — default: support@bestindieapps.com
+//   - REPORT_FROM_EMAIL    — default: support@bestindieapps.com
+//   - REPORT_NOTIFY_EMAIL  — default: bestindieapps@gmail.com
 //
 // Request body (JSON):
 //   {
@@ -36,13 +40,17 @@
 // ---------------------------------------------------------------------------
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "@supabase/supabase-js";
+import nodemailer from "nodemailer";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
+const REPORT_SMTP_HOST = Deno.env.get("REPORT_SMTP_HOST") ?? "mail.privateemail.com";
+const REPORT_SMTP_PORT = Number(Deno.env.get("REPORT_SMTP_PORT") ?? "465");
+const REPORT_SMTP_USER = Deno.env.get("REPORT_SMTP_USER") ?? "support@bestindieapps.com";
+const REPORT_SMTP_PASSWORD = Deno.env.get("REPORT_SMTP_PASSWORD") ?? "";
 const REPORT_NOTIFY_EMAIL = Deno.env.get("REPORT_NOTIFY_EMAIL") ?? "bestindieapps@gmail.com";
-const REPORT_FROM_EMAIL = Deno.env.get("REPORT_FROM_EMAIL") ?? "reports@nexnote.app";
+const REPORT_FROM_EMAIL = Deno.env.get("REPORT_FROM_EMAIL") ?? "support@bestindieapps.com";
 
 const VALID_REASONS = new Set([
     "copyright",
@@ -131,7 +139,7 @@ serve(async (req) => {
 
     // Fire-and-forget email notification. Failure here mustn't fail the
     // request — the DB row is the durable record.
-    if (RESEND_API_KEY) {
+    if (REPORT_SMTP_PASSWORD) {
         try {
             await sendNotificationEmail({
                 reportId: inserted.id,
@@ -145,6 +153,8 @@ serve(async (req) => {
         } catch (e) {
             console.error("[submit-report] email send failed:", (e as Error).message);
         }
+    } else {
+        console.warn("[submit-report] REPORT_SMTP_PASSWORD not set — skipping email notification");
     }
 
     return cors(jsonOk({ ok: true, reportId: inserted.id }));
@@ -161,7 +171,7 @@ interface EmailParams {
 }
 
 async function sendNotificationEmail(p: EmailParams): Promise<void> {
-    const lines = [
+    const html = [
         `<p><strong>New content report</strong></p>`,
         `<p>Reason: <code>${escapeHtml(p.reason)}</code></p>`,
         `<p>Note ID: <code>${escapeHtml(p.noteId)}</code></p>`,
@@ -174,25 +184,35 @@ async function sendNotificationEmail(p: EmailParams): Promise<void> {
         `<p style="color:#94A3B8;font-size:12px;">Report ID ${escapeHtml(p.reportId)}</p>`,
     ].filter(Boolean).join("\n");
 
-    const resp = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${RESEND_API_KEY}`,
-            "Content-Type": "application/json",
+    const text = [
+        "New content report",
+        `Reason: ${p.reason}`,
+        `Note ID: ${p.noteId}`,
+        p.token ? `Share token: ${p.token}` : "",
+        p.reporterName ? `Reporter name: ${p.reporterName}` : "",
+        p.reporterEmail ? `Reporter email: ${p.reporterEmail}` : "",
+        p.description ? `Description:\n${p.description}` : "",
+        `Report ID ${p.reportId}`,
+    ].filter(Boolean).join("\n");
+
+    const transporter = nodemailer.createTransport({
+        host: REPORT_SMTP_HOST,
+        port: REPORT_SMTP_PORT,
+        secure: REPORT_SMTP_PORT === 465,
+        auth: {
+            user: REPORT_SMTP_USER,
+            pass: REPORT_SMTP_PASSWORD,
         },
-        body: JSON.stringify({
-            from: REPORT_FROM_EMAIL,
-            to: [REPORT_NOTIFY_EMAIL],
-            reply_to: p.reporterEmail ?? undefined,
-            subject: `[NuNotes report] ${p.reason} — note ${p.noteId.slice(0, 8)}`,
-            html: lines,
-        }),
     });
 
-    if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Resend ${resp.status}: ${text.slice(0, 300)}`);
-    }
+    await transporter.sendMail({
+        from: REPORT_FROM_EMAIL,
+        to: REPORT_NOTIFY_EMAIL,
+        replyTo: p.reporterEmail ?? undefined,
+        subject: `[NuNotes report] ${p.reason} — note ${p.noteId.slice(0, 8)}`,
+        html,
+        text,
+    });
 }
 
 // ---------------------------------------------------------------------------

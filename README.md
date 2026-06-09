@@ -72,9 +72,14 @@ The marketing-site share + report flow depends on:
    npx supabase functions deploy get-shared-note   # token → note JSON, called by /s/<token>
    npx supabase functions deploy submit-report     # report POST handler, called by /report form
    ```
-3. **Optional secrets for email notifications** on incoming reports (without these, reports still land in `note_reports` — only the email alert is skipped):
+3. **SMTP secret for email notifications** on incoming reports (without `REPORT_SMTP_PASSWORD`, reports still land in `note_reports` — only the email alert is skipped). Uses Private Email (`mail.privateemail.com`) by default:
    ```sh
-   npx supabase secrets set RESEND_API_KEY=re_...           # https://resend.com
-   npx supabase secrets set REPORT_NOTIFY_EMAIL=bestindieapps@gmail.com   # default
-   npx supabase secrets set REPORT_FROM_EMAIL=reports@nexnote.app          # must be a verified Resend domain
+   npx supabase secrets set REPORT_SMTP_PASSWORD='your-mailbox-password'
+   # Optional overrides (defaults shown):
+   npx supabase secrets set REPORT_SMTP_HOST=mail.privateemail.com
+   npx supabase secrets set REPORT_SMTP_PORT=465
+   npx supabase secrets set REPORT_SMTP_USER=support@bestindieapps.com
+   npx supabase secrets set REPORT_FROM_EMAIL=support@bestindieapps.com
+   npx supabase secrets set REPORT_NOTIFY_EMAIL=bestindieapps@gmail.com
    ```
+   Then redeploy: `npx supabase functions deploy submit-report`

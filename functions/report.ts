@@ -158,9 +158,11 @@ function renderReportPage(
     }
     submit.disabled = true;
     submit.textContent = 'Submitting…';
+    // Prefer data-* attrs; fall back to URL params (e.g. opened from iOS with ?noteId=).
+    var params = new URLSearchParams(window.location.search);
     var payload = {
-      token: form.dataset.token || undefined,
-      noteId: form.dataset.noteId || undefined,
+      token: form.dataset.token || params.get('token') || undefined,
+      noteId: form.dataset.noteId || params.get('noteId') || undefined,
       reason: reason,
       description: fd.get('description') || undefined,
       reporterName: fd.get('reporterName') || undefined,
